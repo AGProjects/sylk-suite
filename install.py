@@ -323,7 +323,6 @@ def install_docker():
 
 
 def clone_repo():
-    return
     if DEST_DIR.exists():
         output(f"Repo already exists at {DEST_DIR}, pulling latest changes...")
         run("git pull", cwd=DEST_DIR)
