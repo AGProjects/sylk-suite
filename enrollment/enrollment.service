@@ -1,0 +1,12 @@
+[Unit]
+Description=Enrollment
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/enrollment
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
