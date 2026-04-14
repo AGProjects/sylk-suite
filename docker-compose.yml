@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+  sylkserver:
+    build:
+      context: ./sylkserver
+    image: sylkserver:bookworm
+    container_name: sylkserver
+    networks:
+      sylk-net:
+        ipv4_address: 172.18.0.10
+    ports:
+      - "5060:5060"
+      - "5061:5061"
+#      - "10000-20000:10000-20000/udp"
+    volumes:
+      - ./sylkserver/config:/etc/sylkserver/
+      - sylkserver_tls:/etc/sylkserver/tls:ro
+      - ./sylkserver/data:/var/lib/sylkserver
+      - ./sylkserver/logs:/var/log/sylkserver
+    depends_on:
+      - janus
+    environment:
+        LOCAL_IP: ${LOCAL_IP}
+        NAT: ${NAT}
+        FULL_DOMAIN: ${FULL_DOMAIN}
+        WEB_PORT: ${WEB_PORT}
+        SIP_PORT: ${SIP_PORT}
+    entrypoint: ["/usr/local/bin/entrypoint.sh"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  janus:
+    build:
+      context: ./janus
+    container_name: janus
+    network_mode: host
+    environment:
+        IP: ${IP}
+        NAT: ${NAT}
+        LOCAL_IP: ${LOCAL_IP}
+        RTP_PORT: ${RTP_PORT}
+    entrypoint: ["/usr/local/bin/entrypoint.sh"]
+    volumes:
+      - ./janus/config:/etc/janus
+      - ./janus/log:/var/log/janus
+    restart: unless-stopped
+
+  webrtc:
+    build:
+      context: ./webrtc-nginx
+      args:
+        FULL_DOMAIN: ${FULL_DOMAIN}
+        WEB_PORT: ${WEB_PORT}
+    image: sylk-webrtc-nginx
+    container_name: sylk-webrtc
+    volumes:
+      - ./webrtc-nginx/conf:/etc/nginx/conf.d
+      - ./certbot/conf:/etc/letsencrypt
+    networks:
+      - sylk-net
+    ports:
+      - "${WEB_PORT:-443}:443"
+      - "80:80"
+    depends_on:
+      - sylkserver
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  certbot:
+    build:
+      context: .
+      dockerfile: certbot/Dockerfile
+    image: certbot/certbot
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt:rw
+      - ./certbot/hooks:/hooks:ro
+      - ./certbot/logs:/logs:rw
+    entrypoint: /bin/sh -c "
+      trap exit TERM;
+      while :; do
+        sleep 12h & wait $${!};
+        chmod +x /hooks/auth.py /hooks/cleanup.py;
+        certbot renew \
+          --manual \
+          --preferred-challenges dns \
+          --manual-auth-hook /hooks/auth.py
+          --manual-cleanup-hook /hooks/cleanup.py \
+          --deploy-hook 'docker exec sylk-webrtc nginx -s reload' || true;
+      done"
+    restart: unless-stopped
+  
+networks:
+  sylk-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
+
+volumes:
+  sylkserver_tls: {}
+
