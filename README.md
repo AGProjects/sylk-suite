@@ -4,6 +4,10 @@
  - By AG Projects
  - Homepage http://sylkserver.com
 
+```
+curl -fsSL https://sylkserver.com/suite -o sylk.py; sudo python3 sylk.py
+```
+
 Use this installer to self-host a SIP/WEBRTC server under your own domain.
 
  - Zero configuration with DNS zone and end users account enrollment
@@ -22,13 +26,13 @@ Use this installer to self-host a SIP/WEBRTC server under your own domain.
 
 # Ingredients
 
- - OpenSIPS
- - SylkServer
- - Docker
- - Janus
- - OpenXCAP
- - MediaProxy
- - MSRP Relay
- - SIP Thor Managed DNS hosted service
- - Mobile app (Sylk Mobile)
+ - SIP Thor Managed DNS https://mdns.sipthor.net
+ - OpenSIPS https://opensips.org
+ - SylkServer https://sylkserver.com
+ - Janus https://janus.conf.meetecho.com
+ - OpenXCAP https://openxcap.org
+ - MediaProxy http://mediaproxy.ag-projects.com
+ - MSRP Relay https://msrprelay.org
+ - Mobile Android app (Sylk Mobile) https://play.google.com/store/apps/details?id=com.agprojects.syl
+ - Mobile iOS app (Sylk Mobile) https://apps.apple.com/us/app/id1489960733
  - Compatible with any SIP client
