@@ -332,8 +332,8 @@ def clone_repo():
 
 
 def start_sylk_suite(data):
-    run("cp -r ./sylkserver/config-templates/* ./sylkserver/config/", cwd=DEST_DIR)
-    run("cp -r ./janus/config-templates/* ./janus/config/", cwd=DEST_DIR)
+    run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR)
+    run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR)
     run("docker-compose up -d", cwd=DEST_DIR)
     sleep(1)
     run("chmod +x certbot/hooks/auth.py certbot/hooks/cleanup.py", cwd=DEST_DIR)
@@ -555,9 +555,9 @@ def install_enrollment(data):
     except FileExistsError:
         pass
 
-    run("cp ./enrollment/config.ini /etc/enrollment/")
-    run("cp ./enrollment/enrollment.service /etc/systemd/system/")
-    run("cp ./enrollment/enrollment.py /usr/bin/enrollment")
+    run("cp ./enrollment/config.ini /etc/enrollment/", cwd=DEST_DIR)
+    run("cp ./enrollment/enrollment.service /etc/systemd/system/", cwd=DEST_DIR)
+    run("cp ./enrollment/enrollment.py /usr/bin/enrollment", cwd=DEST_DIR)
     run("chmod +x /usr/bin/enrollment")
 
     docker_ip = run("ip addr show docker0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
@@ -582,10 +582,9 @@ def install_enrollment(data):
 
 def create_domain(data):
     try:
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        LOG_DIR = os.path.join(BASE_DIR, "certbot/logs")
+        LOG_DIR = os.path.join(DEST_DIR, "certbot/logs")
         os.makedirs(LOG_DIR, exist_ok=True)
-        MAINLOG_DIR = os.path.join(BASE_DIR, "logs")
+        MAINLOG_DIR = os.path.join(DEST_DIR, "logs")
         os.makedirs(MAINLOG_DIR, exist_ok=True)
         dns_mananagement_filename = os.path.join(MAINLOG_DIR, f"dns_management.json")
 
@@ -827,12 +826,12 @@ def main(components, exclude_components):
         make_step("Install Enrollment")
         install_enrollment(data)
 
-    run("chmod +x scripts/* > /dev/null")
+    run("chmod +x scripts/* > /dev/null", cwd=DEST_DIR)
 
     run("apt-get install -y -qq qrencode > /dev/null")
     try:
         result = dns_template.replace("IPADDR", data.ip).replace("DOMAINNAME", data.full_domain)
-        weburl = data.full_domain;
+        weburl = data.full_domain
         if data.web_port != "443":
             weburl = weburl + ":" + data.web_port
         result = result.replace("WEBURL", weburl)
@@ -840,7 +839,7 @@ def main(components, exclude_components):
         result = result.replace("SIPTCPPORT", data.sip_port)
         sip_tls_port = int(data.sip_port) + 1
         result = result.replace("SIPTLSPORT", str(sip_tls_port))
-        dns_email = data.email.replace("@", ".");
+        dns_email = data.email.replace("@", ".")
         result = result.replace("support@ag-projects.com", dns_email)
 
         max_length = max(len(line) for line in result.splitlines())
@@ -848,8 +847,7 @@ def main(components, exclude_components):
         print(result)
         print(f"{'=' * max_length}\n")
 
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        MAINLOG_DIR = os.path.join(BASE_DIR, "logs")
+        MAINLOG_DIR = os.path.join(DEST_DIR, "logs")
 
         with open(os.path.join(MAINLOG_DIR, f"{data.full_domain}.zone"), 'w') as result_file:
             result_file.write(f"{result}\n")
