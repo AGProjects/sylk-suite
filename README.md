@@ -33,6 +33,6 @@ Use this installer to self-host a SIP/WEBRTC server under your own domain.
  - OpenXCAP https://openxcap.org
  - MediaProxy http://mediaproxy.ag-projects.com
  - MSRP Relay https://msrprelay.org
- - Mobile Android app (Sylk Mobile) https://play.google.com/store/apps/details?id=com.agprojects.syl
+ - Mobile Android app (Sylk Mobile) https://play.google.com/store/apps/details?id=com.agprojects.sylk
  - Mobile iOS app (Sylk Mobile) https://apps.apple.com/us/app/id1489960733
  - Compatible with any SIP client
