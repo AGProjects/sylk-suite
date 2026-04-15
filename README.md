@@ -1,11 +1,11 @@
 
 # Sylk Suite installer
 
- - By AG Projects
- - Homepage http://sylkserver.com
+ - By AG Projects http://ag-projects.com
+ - Project homepage https://github.com/AGProjects/sylk-suite
 
 ```
-curl -fsSL https://sylkserver.com/suite -o sylk.py; sudo python3 sylk.py
+curl -L https://sylkserver.com/suite -o sylk.py; sudo python3 sylk.py
 ```
 
 Use this installer to self-host a SIP/WEBRTC server under your own domain.
@@ -36,3 +36,13 @@ Use this installer to self-host a SIP/WEBRTC server under your own domain.
  - Mobile Android app (Sylk Mobile) https://play.google.com/store/apps/details?id=com.agprojects.sylk
  - Mobile iOS app (Sylk Mobile) https://apps.apple.com/us/app/id1489960733
  - Compatible with any SIP client
+
+
+# Uninstall
+
+The software is installed in /opt/sylk-suite.  To remove the installed software
+packages run:
+
+```
+/opt/sylk-suite/scripts/uninstall.sh
+```
