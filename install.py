@@ -758,7 +758,7 @@ def main(components, exclude_components):
         sys.exit(1)
 
     os.system('apt-get install -qq -y python3-psutil apt-utils joe ngrep tcpdump> /dev/null')
-    os.system('echo "options nf_conntrack enable_hooks=1" | sudo tee /etc/modprobe.d/nf_conntrack.conf')
+    os.system('echo "options nf_conntrack enable_hooks=1" | sudo tee /etc/modprobe.d/nf_conntrack.conf > /dev/null')
 
     print("""
     ███████ ██    ██ ██      ██   ██     ███████ ██    ██ ██ ████████ ███████ 
