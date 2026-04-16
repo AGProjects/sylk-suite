@@ -375,11 +375,12 @@ def start_sylk_suite(data):
         pass
 
     if regenerate:
+        output("Domain or port changed, rebuilding web app and config")
         run("docker-compose build --no-cache webrtc", cwd=DEST_DIR, silent=True)
-
+        run("docker-compose up -d", cwd=DEST_DIR, silent=True)
     run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=DEST_DIR, silent=True)
     # update_sylk_config(data)
-    output("Sylk Server abd Janus server installed")
+    output("Sylk Server and Janus server installed")
 
 
 def install_opensips(data, mysql=True, force_mysql=False):
