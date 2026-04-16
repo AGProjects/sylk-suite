@@ -358,7 +358,7 @@ def start_sylk_suite(data):
     output("Sylk Suite installed")
 
 
-def install_opensips(data, mysql=True):
+def install_opensips(data, mysql=True, force_mysql=False):
     run("curl -fsSL https://download.ag-projects.com/agp-debian-key.gpg -o /usr/share/keyrings/agp-debian-key.gpg")
     run('echo "deb [signed-by=/usr/share/keyrings/agp-debian-key.gpg] https://packages.ag-projects.com/debian bookworm main contrib" > /etc/apt/sources.list.d/ag-projects.list')
 
@@ -432,9 +432,16 @@ def install_opensips(data, mysql=True):
     run("opensips-config", cwd='/etc/opensips/')
 
     if mysql:
-        run("opensips-dbinit", cwd='/etc/opensips/')
-        run("cat /usr/share/doc/opensips-config-sylkserver/push_tokens.sql | sudo mysql opensips")
-        run(f"mysql opensips -e \"insert into domain (domain) values ('{data.full_domain}')\"")
+        db_exists = subprocess.run(
+            ["mysql", "-e", "USE opensips"],
+            capture_output=True
+        ).returncode == 0
+
+        if not db_exists or force_mysql:
+            run("opensips-dbinit", cwd='/etc/opensips/')
+            run("cat /usr/share/doc/opensips-config-sylkserver/push_tokens.sql | sudo mysql opensips")
+
+        run(f"mysql opensips -e \"insert ignore into domain (domain) values ('{data.full_domain}')\"")
 
     run("systemctl restart opensips")
     run("opensips-cli -x mi domain_reload")
@@ -751,7 +758,7 @@ def setup_data(data=None):
     return data
 
 
-def main(components, exclude_components):
+def main(components, exclude_components, force_mysql=False):
     if os.geteuid() != 0:
         error("Please run this script with sudo or as root")
         sys.exit(1)
@@ -808,7 +815,7 @@ def main(components, exclude_components):
 
     if install_components['opensips']:
         make_step("Install OpenSIPS")
-        install_opensips(data, install_components['mysql'])
+        install_opensips(data, install_components['mysql'], force_mysql=force_mysql)
 
     if install_components['mediaproxy']:
         make_step("Install MediaProxy")
@@ -887,11 +894,17 @@ if __name__ == "__main__":
         type=parse_components,
         help=f"Comma-separated list of excluded components: {', '.join(sorted(ALLOWED_COMPONENTS))}"
     )
+    parser.add_argument(
+        "--force-mysql",
+        action="store_true",
+        default=False,
+        help="Recreate the OpenSIPS MySQL database even if it already exists"
+    )
 
 
     try:
         args = parser.parse_args()
-        main(args.include, args.exclude)
+        main(args.include, args.exclude, force_mysql=args.force_mysql)
 
     except KeyboardInterrupt:
         print()
