@@ -207,12 +207,14 @@ def error(text):
 def make_step(msg, step_color=CYAN):
     global step
     step = step + 1
-    print("\n" + "-" * 80)
+    #print("\n" + "-" * 80)
+    print("")
     print(f"{step_color}[STEP {step}] {msg}{RESET}")
 
 
-def run(cmd, cwd=None):
-    print(f"{BLUE}>>> {cmd}{RESET}")
+def run(cmd, cwd=None, silent=False, echo=True):
+    if not silent and echo:
+        print(f"{BLUE}>>> {cmd}{RESET}")
     process = subprocess.Popen(
         cmd,
         shell=True,
@@ -226,13 +228,15 @@ def run(cmd, cwd=None):
     output_lines = []
     for line in process.stdout:
         line_clean = line.replace('\r', '').strip()
-        if line_clean and "Reading database" not in line_clean:
+        if not silent and line_clean and "Reading database" not in line_clean:
             print(line_clean)
         output_lines.append(line)
 
     process.wait()
 
     if process.returncode != 0:
+        if silent or not echo:
+            print(f"{BLUE}>>> {cmd}{RESET}")
         print(f"{RED}Command failed!{RESET}")
         sys.exit(process.returncode)
     return ''.join(output_lines)
@@ -310,33 +314,35 @@ def get_unique_short_subdomain(max_attempts=1000, domain="sylk.link"):
 
 
 def install_docker():
-    run("apt-get update -qq && apt-get install -y ca-certificates curl gnupg > /dev/null")
+    run("apt-get update -qq && apt-get install -y ca-certificates curl gnupg > /dev/null", silent=True)
     if not check_command("docker"):
-        run("apt-get update -qq")
-        run("apt-get install -y -qq docker.io docker-compose > /dev/null")
-        run("systemctl enable docker")
-        run("systemctl start docker")
+        run("apt-get update -qq", silent=True)
+        run("apt-get install -y -qq docker.io docker-compose > /dev/null", silent=True)
+        run("systemctl enable docker", silent=True)
+        run("systemctl start docker", silent=True)
     else:
         output("Docker already installed")
     if not check_command("git"):
-        run("apt install -y -qq git")
+        run("apt install -y -qq git", silent=True)
 
 
 def clone_repo():
     if DEST_DIR.exists():
         output(f"Repo already exists at {DEST_DIR}, pulling latest changes...")
-        run("git pull", cwd=DEST_DIR)
+        run("git pull", cwd=DEST_DIR, silent=True)
     else:
         output(f"Cloning repo into {DEST_DIR}...")
-        run(f"git clone {REPO_URL} {DEST_DIR}")
+        run(f"git clone {REPO_URL} {DEST_DIR}", silent=True)
 
 
 def start_sylk_suite(data):
-    run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR)
-    run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR)
-    run("docker-compose up -d", cwd=DEST_DIR)
+    run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR, silent=True)
+    run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR, silent=True)
+    run("docker-compose up -d", cwd=DEST_DIR, silent=True)
     sleep(1)
-    run("chmod +x certbot/hooks/auth.py certbot/hooks/cleanup.py", cwd=DEST_DIR)
+    run("chmod +x certbot/hooks/auth.py certbot/hooks/cleanup.py", cwd=DEST_DIR, silent=True)
+    # Remove stale certbot lock file left behind by interrupted runs
+    run('docker-compose run -T --rm --entrypoint "" certbot rm -f /etc/letsencrypt/.certbot.lock', cwd=DEST_DIR, silent=True)
     run(
         f"""
         docker-compose run -T --rm --entrypoint "" certbot certbot certonly \
@@ -350,26 +356,31 @@ def start_sylk_suite(data):
         --agree-tos \
         --no-eff-email
         """,
-        cwd=DEST_DIR
+        cwd=DEST_DIR,
+        echo=False
     )
-    run("cp ./webrtc-nginx/domain.conf ./webrtc-nginx/conf/", cwd=DEST_DIR)
-    run(f"sed -i 's/FULLDOMAIN/{data.full_domain}/g' ./webrtc-nginx/conf/domain.conf", cwd=DEST_DIR)
-    run("docker exec sylk-webrtc nginx -s reload")
-    output("Sylk Suite installed")
+    run("cp ./webrtc-nginx/domain.conf ./webrtc-nginx/conf/", cwd=DEST_DIR, silent=True)
+    run(f"sed -i 's/FULLDOMAIN/{data.full_domain}/g' ./webrtc-nginx/conf/domain.conf", cwd=DEST_DIR, silent=True)
+    run("docker exec sylk-webrtc nginx -s reload", silent=True)
+    output("NGINX Web server installed")
+    run("mkdir -p ./webrtc-nginx/html", cwd=DEST_DIR, silent=True)
+    run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=DEST_DIR, silent=True)
+    update_sylk_config(data)
+    output("Sylk Server abd Janus server installed")
 
 
 def install_opensips(data, mysql=True, force_mysql=False):
-    run("curl -fsSL https://download.ag-projects.com/agp-debian-key.gpg -o /usr/share/keyrings/agp-debian-key.gpg")
-    run('echo "deb [signed-by=/usr/share/keyrings/agp-debian-key.gpg] https://packages.ag-projects.com/debian bookworm main contrib" > /etc/apt/sources.list.d/ag-projects.list')
+    run("curl -fsSL https://download.ag-projects.com/agp-debian-key.gpg -o /usr/share/keyrings/agp-debian-key.gpg", silent=True)
+    run('echo "deb [signed-by=/usr/share/keyrings/agp-debian-key.gpg] https://packages.ag-projects.com/debian bookworm main contrib" > /etc/apt/sources.list.d/ag-projects.list', silent=True)
 
-    run("curl -fsSL https://apt.opensips.org/opensips-org.gpg -o /usr/share/keyrings/opensips-org.gpg")
-    run('echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm 3.5-releases" > /etc/apt/sources.list.d/opensips.list')
-    run('echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm cli-nightly" > /etc/apt/sources.list.d/opensips-cli.list')
+    run("curl -fsSL https://apt.opensips.org/opensips-org.gpg -o /usr/share/keyrings/opensips-org.gpg", silent=True)
+    run('echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm 3.5-releases" > /etc/apt/sources.list.d/opensips.list', silent=True)
+    run('echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm cli-nightly" > /etc/apt/sources.list.d/opensips-cli.list', silent=True)
 
-    run("apt-get update -qq && apt-get install -qq -y opensips-config-sylkserver > /dev/null")
+    run("apt-get update -qq && apt-get install -qq -y opensips-config-sylkserver > /dev/null", silent=True)
 
-    run(f"cp -L {DEST_DIR}/certbot/conf/live/{data.full_domain}/fullchain.pem  /etc/opensips/tls/default.crt")
-    run(f"cp -L {DEST_DIR}/certbot/conf/live/{data.full_domain}/privkey.pem  /etc/opensips/tls/default.key")
+    run(f"cp -L {DEST_DIR}/certbot/conf/live/{data.full_domain}/fullchain.pem  /etc/opensips/tls/default.crt", silent=True)
+    run(f"cp -L {DEST_DIR}/certbot/conf/live/{data.full_domain}/privkey.pem  /etc/opensips/tls/default.key", silent=True)
 
     if data.nat:
         subprocess.run(
@@ -379,7 +390,7 @@ def install_opensips(data, mysql=True, force_mysql=False):
         )
 
         sed_expr = "/SYLK_SERVER_IP/s/\\`127.0.0.1'/\\`172.18.0.10'/g"
-        run(f"sed -i {sed_expr} /etc/opensips/config/settings.m4")
+        run(f"sed -i {sed_expr} /etc/opensips/config/settings.m4", silent=True)
 
         subprocess.run(
             ["sed", "-i", rf"s#^define(`PUSH_SERVER_URL',.*#define(`PUSH_SERVER_URL', `{PUSH_URL}')#",
@@ -388,10 +399,10 @@ def install_opensips(data, mysql=True, force_mysql=False):
         )
 
         sed_expr = f"/ADVERTISED_SERVER_IP/s/\\`SERVER_IP'/\\`{data.ip}'/g"
-        run(f"sed -i {sed_expr} /etc/opensips/config/settings.m4")
+        run(f"sed -i {sed_expr} /etc/opensips/config/settings.m4", silent=True)
 
         sed_expr = f"s/, SERVER_IP)/, \\`{data.ip}\\')/g"
-        run(f"sed -i \"{sed_expr}\" /etc/opensips/config/settings.m4")
+        run(f"sed -i \"{sed_expr}\" /etc/opensips/config/settings.m4", silent=True)
 
         subprocess.run(
             ["sed", "-i", r"s#^define(`ENABLE_LATE_FORKING',.*#define(`ENABLE_LATE_FORKING', `1')#",
@@ -405,22 +416,22 @@ def install_opensips(data, mysql=True, force_mysql=False):
         # )
 
         sed_expr = f"/ADVERTISED_SERVER_IP/s/, \\`[^']*'/, \\`{data.ip}'/"
-        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4')
+        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4', silent=True)
 
         sip_port = data.sip_port
         sip_tls_port = int(sip_port) + 1
 
         sed_expr = f"/SYLK_SERVER_IP_SOURCE/s/, \\`[^']*'/, \\`{data.ip}'/"
-        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4')
+        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4', silent=True)
 
         sed_expr = f"/SERVER_UDP_PORT/s/, \\`[^']*'/, \\`{sip_port}'/"
-        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4')
+        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4', silent=True)
 
         sed_expr = f"/SERVER_TCP_PORT/s/, \\`[^']*'/, \\`{sip_port}'/"
-        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4')
+        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4', silent=True)
 
         sed_expr = f"/SERVER_TLS_PORT/s/, \\`[^']*'/, \\`{sip_tls_port}'/"
-        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4')
+        run(f'sed -i "{sed_expr}" /etc/opensips/config/settings.m4', silent=True)
 
     else:
         subprocess.run(
@@ -429,7 +440,7 @@ def install_opensips(data, mysql=True, force_mysql=False):
             check=True
         )
 
-    run("opensips-config", cwd='/etc/opensips/')
+    run("opensips-config", cwd='/etc/opensips/', silent=True)
 
     if mysql:
         db_exists = subprocess.run(
@@ -438,19 +449,52 @@ def install_opensips(data, mysql=True, force_mysql=False):
         ).returncode == 0
 
         if not db_exists or force_mysql:
-            run("opensips-dbinit", cwd='/etc/opensips/')
-            run("cat /usr/share/doc/opensips-config-sylkserver/push_tokens.sql | sudo mysql opensips")
+            run("opensips-dbinit", cwd='/etc/opensips/', silent=True)
+            run("cat /usr/share/doc/opensips-config-sylkserver/push_tokens.sql | sudo mysql opensips", silent=True)
 
-        run(f"mysql opensips -e \"insert ignore into domain (domain) values ('{data.full_domain}')\"")
+        run(f"mysql opensips -e \"insert ignore into domain (domain) values ('{data.full_domain}')\"", silent=True)
 
-    run("systemctl restart opensips")
-    run("opensips-cli -x mi domain_reload")
-    run("systemctl enable opensips")
+    run("systemctl restart opensips", silent=True)
+    run("opensips-cli -x mi domain_reload", silent=True)
+    domain_dump = run("opensips-cli -x mi domain_dump", silent=True)
+    try:
+        domains = [d["name"] for d in json.loads(domain_dump).get("Domains", [])]
+        output(f"OpenSIPS active domains: {', '.join(domains)}")
+    except Exception:
+        pass
+    run("systemctl enable opensips", silent=True)
+
+    try:
+        with open("/etc/opensips/opensips.cfg") as f:
+            cfg = f.read()
+
+        advertised = re.search(r'advertised_address\s*=\s*"([^"]+)"', cfg)
+        advertised_addr = advertised.group(1) if advertised else "unknown"
+
+        udp_ports  = re.findall(r'socket\s*=\s*udp:[^:]+:(\d+)', cfg)
+        tcp_ports  = re.findall(r'socket\s*=\s*tcp:[^:]+:(\d+)', cfg)
+        tls_ports  = re.findall(r'socket\s*=\s*tls:[^:]+:(\d+)', cfg)
+
+        parts = []
+        for port in dict.fromkeys(udp_ports + tcp_ports):
+            protos = []
+            if port in udp_ports:
+                protos.append("UDP")
+            if port in tcp_ports:
+                protos.append("TCP")
+            parts.append(f"{port} {' '.join(protos)}")
+        for port in dict.fromkeys(tls_ports):
+            parts.append(f"{port} TLS")
+
+        output(f"OpenSIPS listening on: {advertised_addr} ports ({', '.join(parts)})")
+    except Exception:
+        pass
+
     output("OpenSIPS installed")
 
 
 def install_mediaproxy(data):
-    run("cp /usr/share/doc/mediaproxy-common/tls/* /etc/mediaproxy/tls/")
+    run("cp /usr/share/doc/mediaproxy-common/tls/* /etc/mediaproxy/tls/", silent=True)
 
     config_path = '/etc/mediaproxy/config.ini'
 
@@ -474,11 +518,20 @@ def install_mediaproxy(data):
     with open(config_path, 'w') as configfile:
         config.write(configfile)
 
-    run("systemctl restart mediaproxy-dispatcher")
-    run("systemctl restart mediaproxy-relay")
-    run("systemctl enable mediaproxy-dispatcher")
-    run("systemctl enable mediaproxy-relay")
+    run("systemctl restart mediaproxy-dispatcher", silent=True)
+    run("systemctl restart mediaproxy-relay", silent=True)
+    run("systemctl enable mediaproxy-dispatcher", silent=True)
+    run("systemctl enable mediaproxy-relay", silent=True)
 
+    try:
+        mp_config = configparser.ConfigParser()
+        mp_config.optionxform = str
+        mp_config.read('/etc/mediaproxy/config.ini')
+        mp_ip = mp_config.get('Relay', 'advertised_ip', fallback=None) or mp_config.get('Relay', 'address', fallback='unknown')
+        mp_ports = mp_config.get('Relay', 'port_range', fallback='unknown')
+        output(f"MediaProxy listening on: {mp_ip} RTP port range {mp_ports}")
+    except Exception:
+        pass
     output("MediaProxy installed and configured")
 
 
@@ -504,13 +557,23 @@ def install_msrprelay(data):
 
     with open(config_path, 'w') as configfile:
         config.write(configfile)
-    run("systemctl restart msrprelay")
-    run("systemctl enable msrprelay")
-    output("MSRPRelay installed and configured")
+    run("systemctl restart msrprelay", silent=True)
+    run("systemctl enable msrprelay", silent=True)
+    try:
+        mr_config = configparser.ConfigParser()
+        mr_config.optionxform = str
+        mr_config.read('/etc/msrprelay/config.ini')
+        hostname = mr_config.get('Relay', 'hostname', fallback='unknown')
+        address  = mr_config.get('Relay', 'address', fallback='')
+        port = address.split(':')[-1] if ':' in address else address
+        output(f"MSRP Relay listening on: tls:{hostname}:{port}")
+    except Exception:
+        pass
+    output("MSRP Relay installed and configured")
 
 
 def install_openxcap(data):
-    run("apt-get install -y -qq openxcap > /dev/null")
+    run("apt-get install -y -qq openxcap > /dev/null", silent=True)
     config_path = '/etc/openxcap/config.ini'
 
     config = configparser.ConfigParser()
@@ -519,7 +582,7 @@ def install_openxcap(data):
     if 'Server' not in config:
         config['Server'] = {}
 
-    docker_ip = run("ip addr show docker0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
+    docker_ip = run("ip addr show docker0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1", silent=True).strip()
     config['Server']['address'] = f"{docker_ip}"
     config['Server']['port'] = "8080"
     config['Server']['backend'] = "OpenSIPS"
@@ -550,9 +613,71 @@ def install_openxcap(data):
     with open(config_path, 'w') as configfile:
         config.write(configfile)
 
-    run("systemctl restart openxcap")
-    run("systemctl enable openxcap")
-    output("MSRPRelay installed and configured")
+    run("systemctl enable openxcap", silent=True)
+    run("systemctl restart openxcap", silent=True)
+    try:
+        xcap_config = configparser.ConfigParser()
+        xcap_config.optionxform = str
+        xcap_config.read('/etc/openxcap/config.ini')
+        root = xcap_config.get('Server', 'root', fallback='unknown')
+        output(f"OpenXCAP XCAP root: {root}")
+    except Exception:
+        pass
+    output("OpenXCAP installed and configured")
+
+
+def update_sylk_config(data):
+    port = f":{data.web_port}" if data.web_port and data.web_port != "443" else ""
+    domain = data.full_domain
+
+    config = {
+        "defaultDomain":           domain,
+        "enrollmentDomain":        domain,
+        "nonSipDomains":           [],
+        "publicUrl":               f"https://{domain}{port}",
+        "enrollmentUrl":           f"https://{domain}{port}/enrollment/user",
+        "defaultConferenceDomain": f"videoconference.{domain}",
+        "defaultGuestDomain":      f"guest.{domain}",
+        "wsServer":                f"wss://{domain}{port}/ws",
+        "fileSharingUrl":          f"https://{domain}{port}/filesharing",
+        "fileTransferUrl":         f"https://{domain}{port}/filetransfer",
+        "iceServers":              [{"urls": "stun:stun.sipthor.net:3478"}],
+        "muteGuestAudioOnJoin":    False,
+        "guestUserPermissions": {
+            "allowMuteAllParticipants":     False,
+            "allowToggleHandsParticipants": False
+        },
+        "showGuestCompleteScreen": True,
+        "downloadUrl":             "https://sylkserver.com",
+        "testNumbers": [
+            {"uri": f"echo@{domain}",     "name": "Test microphone"},
+            {"uri": f"playback@{domain}", "name": "Test video"}
+        ]
+    }
+
+    config_path = DEST_DIR / "webrtc-nginx" / "sylk-config.json"
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+
+    run(f"docker cp {config_path} sylk-webrtc:/usr/share/nginx/html/sylk-config.json", silent=True)
+    run("mkdir -p ./webrtc-nginx/html", cwd=DEST_DIR, silent=True)
+    run(f"cp {config_path} ./webrtc-nginx/html/sylk-config.json", cwd=DEST_DIR, silent=True)
+    run("docker exec sylk-webrtc nginx -s reload", silent=True)
+    output(f"Web frontend available at: https://{domain}{port}")
+    output(f"Mobile app configuration file: {config_path}")
+
+
+def restart_enrollment(data):
+    config_path = '/etc/enrollment/config.ini'
+    config = configparser.ConfigParser()
+    config.optionxform = str
+    config.read(config_path)
+    if 'server' not in config:
+        config['server'] = {}
+    config['server']['domain'] = f"{data.full_domain}"
+    with open(config_path, 'w') as configfile:
+        config.write(configfile)
+    run("systemctl restart enrollment", silent=True)
 
 
 def install_enrollment(data):
@@ -562,12 +687,12 @@ def install_enrollment(data):
     except FileExistsError:
         pass
 
-    run("cp ./enrollment/config.ini /etc/enrollment/", cwd=DEST_DIR)
-    run("cp ./enrollment/enrollment.service /etc/systemd/system/", cwd=DEST_DIR)
-    run("cp ./enrollment/enrollment.py /usr/bin/enrollment", cwd=DEST_DIR)
-    run("chmod +x /usr/bin/enrollment")
+    run("cp ./enrollment/config.ini /etc/enrollment/", cwd=DEST_DIR, silent=True)
+    run("cp ./enrollment/enrollment.service /etc/systemd/system/", cwd=DEST_DIR, silent=True)
+    run("cp ./enrollment/enrollment.py /usr/bin/enrollment", cwd=DEST_DIR, silent=True)
+    run("chmod +x /usr/bin/enrollment", silent=True)
 
-    docker_ip = run("ip addr show docker0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
+    docker_ip = run("ip addr show docker0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1", silent=True).strip()
     config = configparser.ConfigParser()
     config.optionxform = str
     config.read(config_path)
@@ -581,10 +706,19 @@ def install_enrollment(data):
     with open(config_path, 'w') as configfile:
         config.write(configfile)
 
-    run("systemctl daemon-reload")
-    run("systemctl enable enrollment")
-    run("systemctl start enrollment")
-    output("Enrollment installed and configured")
+    run("systemctl daemon-reload", silent=True)
+    run("systemctl enable enrollment", silent=True)
+    restart_enrollment(data)
+
+    sylk_config_path = DEST_DIR / "webrtc-nginx" / "sylk-config.json"
+    try:
+        with open(sylk_config_path) as f:
+            enrollment_url = json.load(f).get("enrollmentUrl", "")
+            # strip trailing /user path segment
+            enrollment_base = enrollment_url.rsplit("/", 1)[0] if enrollment_url.endswith("/user") else enrollment_url
+        output(f"Enrollment started at: {enrollment_base}")
+    except Exception:
+        output("Enrollment installed and configured")
 
 
 def create_domain(data):
@@ -628,7 +762,7 @@ def create_domain(data):
                 domain = payload.get('zone', 'unknown')
                 dns_zone = domain + ".sylk.link"
 
-                output("Sylk domain created %s" % dns_zone)
+                output("Sylk domain created %s at %s" % (dns_zone, ENROLLMENT_URL))
 
                 ts = datetime.now(UTC).isoformat()
 
@@ -660,7 +794,7 @@ def create_domain(data):
                     with open(dns_mananagement_filename, "w", encoding="utf-8") as f:
                         json.dump(mdns, f, indent=2)
 
-                    print("Check %s for how to manage your DNS zone" % dns_mananagement_filename)
+                output("Managed DNS login credentials: %s" % dns_mananagement_filename)
 
                 log_data['timestamp'] = ts
                 filename = os.path.join(LOG_DIR, f"{domain}.sylk.link.json")
@@ -668,6 +802,8 @@ def create_domain(data):
                 # Use by certbot
                 with open(filename, "w", encoding="utf-8") as f:
                     json.dump(log_data, f, indent=2)
+
+                output("Managed DNS zone metadata: %s" % filename)
 
             else:
                 sys.exit(1)
@@ -800,18 +936,18 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
             install_components[comp] = False
 
     if install_components['dns']:
-        make_step("Creating domain")
+        make_step("Create DNS zone")
         create_domain(data)
 
     if install_components['docker']:
-        make_step("Installing Docker")
+        make_step("Install Docker")
         install_docker()
         if not skip_git:
             make_step("Clone repository")
             clone_repo()
 
     if install_components['sylkserver']:
-        make_step("Start sylk-suite and get certificate")
+        make_step("Get certificate")
         start_sylk_suite(data)
 
     if install_components['opensips']:
@@ -834,9 +970,9 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         make_step("Install Enrollment")
         install_enrollment(data)
 
-    run("chmod +x scripts/* > /dev/null", cwd=DEST_DIR)
+    run("chmod +x scripts/* > /dev/null", cwd=DEST_DIR, silent=True)
 
-    run("apt-get install -y -qq qrencode > /dev/null")
+    run("apt-get install -y -qq qrencode > /dev/null", silent=True)
     try:
         result = dns_template.replace("IPADDR", data.ip).replace("DOMAINNAME", data.full_domain)
         weburl = data.full_domain
@@ -850,19 +986,19 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         dns_email = data.email.replace("@", ".")
         result = result.replace("support@ag-projects.com", dns_email)
 
-        max_length = max(len(line) for line in result.splitlines())
-        print(f"\n{'=' * max_length}\nDNS Zone: {data.full_domain}\n{'-' * max_length}")
-        print(result)
-        print(f"{'=' * max_length}\n")
-
         MAINLOG_DIR = os.path.join(DEST_DIR, "logs")
+        zone_file = os.path.join(MAINLOG_DIR, f"{data.full_domain}.zone")
 
-        with open(os.path.join(MAINLOG_DIR, f"{data.full_domain}.zone"), 'w') as result_file:
+        with open(zone_file, 'w') as result_file:
             result_file.write(f"{result}\n")
+
+        make_step("DNS zone")
+        output(f"Zone content: {zone_file}")
     except Exception as e:
         print(f"Error writing DNS zones file: {e}")
 
     # save DNS push
+    make_step("Mobile app enrollment")
     os.system(f"qrencode -t ansiutf8 {data.full_domain}")
 
 
@@ -907,7 +1043,6 @@ if __name__ == "__main__":
         default=False,
         help="Skip cloning or pulling the repository (use existing local copy)"
     )
-
 
     try:
         args = parser.parse_args()
