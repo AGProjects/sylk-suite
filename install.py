@@ -364,8 +364,21 @@ def start_sylk_suite(data):
     run("docker exec sylk-webrtc nginx -s reload", silent=True)
     output("NGINX Web server installed")
     run("mkdir -p ./webrtc-nginx/html", cwd=DEST_DIR, silent=True)
-    run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=DEST_DIR, silent=True)
-    update_sylk_config(data)
+    regenerate = False
+    try:
+        with open(f"{DEST_DIR}/webrtc-nginx/html/sylk-config.json") as f:
+            cfg = f.read()
+            cfg_parsed = json.loads(cfg)
+            if cfg_parsed['publicUrl'] != f'https://{data.full_domain}:{data.web_port}':
+                regenerate = True
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    if regenerate:
+        run("docker-compose build --no-cache webrtc", cwd=dest_dir, silent=true)
+
+    run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=dest_dir, silent=true)
+    # update_sylk_config(data)
     output("Sylk Server abd Janus server installed")
 
 
