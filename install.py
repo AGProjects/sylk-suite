@@ -369,8 +369,8 @@ def start_sylk_suite(data):
         with open(f"{DEST_DIR}/webrtc-nginx/html/sylk-config.json") as f:
             cfg = f.read()
             cfg_parsed = json.loads(cfg)
-            if cfg_parsed['publicUrl'] != f'https://{data.full_domain}:{data.web_port}':
-                regenerate = True
+            expected_url = f"https://{data.full_domain}" if data.web_port == '443' else f"https://{data.full_domain}:{data.web_port}"
+            regenerate = cfg_parsed['publicUrl'] != expected_url
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
