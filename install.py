@@ -758,7 +758,7 @@ def setup_data(data=None):
     return data
 
 
-def main(components, exclude_components, force_mysql=False):
+def main(components, exclude_components, force_mysql=False, skip_git=False):
     if os.geteuid() != 0:
         error("Please run this script with sudo or as root")
         sys.exit(1)
@@ -806,8 +806,9 @@ def main(components, exclude_components, force_mysql=False):
     if install_components['docker']:
         make_step("Installing Docker")
         install_docker()
-        make_step("Clone repository")
-        clone_repo()
+        if not skip_git:
+            make_step("Clone repository")
+            clone_repo()
 
     if install_components['sylkserver']:
         make_step("Start sylk-suite and get certificate")
@@ -900,11 +901,17 @@ if __name__ == "__main__":
         default=False,
         help="Recreate the OpenSIPS MySQL database even if it already exists"
     )
+    parser.add_argument(
+        "--skip-git",
+        action="store_true",
+        default=False,
+        help="Skip cloning or pulling the repository (use existing local copy)"
+    )
 
 
     try:
         args = parser.parse_args()
-        main(args.include, args.exclude, force_mysql=args.force_mysql)
+        main(args.include, args.exclude, force_mysql=args.force_mysql, skip_git=args.skip_git)
 
     except KeyboardInterrupt:
         print()
