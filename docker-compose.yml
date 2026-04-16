@@ -57,6 +57,7 @@ services:
     container_name: sylk-webrtc
     volumes:
       - ./webrtc-nginx/conf:/etc/nginx/conf.d
+      - ./webrtc-nginx/html:/usr/share/nginx/html
       - ./certbot/conf:/etc/letsencrypt
     networks:
       - sylk-net

@@ -37,12 +37,19 @@ FROM nginx:alpine
 #RUN rm /etc/nginx/conf.d/default.conf
 
 #COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=build /build/dist /usr/share/nginx/html
-COPY --from=build /build/sylk-config.json /usr/share/nginx/html
+
+# Store built files in a staging dir so a bind-mounted /usr/share/nginx/html
+# doesn't hide them. The entrypoint copies them into the mount at startup.
+COPY --from=build /build/dist /usr/share/nginx/html-built
+COPY --from=build /build/sylk-config.json /usr/share/nginx/html-built
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 #VOLUME /etc/ssl/sylkserver
 
 EXPOSE 80 443
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["nginx", "-g", "daemon off;"]
 
