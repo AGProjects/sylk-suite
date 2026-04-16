@@ -322,11 +322,11 @@ def install_docker():
         run("systemctl start docker", silent=True)
     else:
         output("Docker already installed")
-    if not check_command("git"):
-        run("apt install -y -qq git", silent=True)
 
 
 def clone_repo():
+    if not check_command("git"):
+        run("apt install -y -qq git", silent=True)
     if DEST_DIR.exists():
         output(f"Repo already exists at {DEST_DIR}, pulling latest changes...")
         run("git pull", cwd=DEST_DIR, silent=True)
@@ -935,6 +935,10 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         for comp in exclude_components:
             install_components[comp] = False
 
+    if not skip_git:
+        make_step("Clone repository")
+        clone_repo()
+
     if install_components['dns']:
         make_step("Create DNS zone")
         create_domain(data)
@@ -942,9 +946,6 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     if install_components['docker']:
         make_step("Install Docker")
         install_docker()
-        if not skip_git:
-            make_step("Clone repository")
-            clone_repo()
 
     if install_components['sylkserver']:
         make_step("Get certificate")
