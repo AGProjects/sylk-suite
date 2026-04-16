@@ -961,7 +961,7 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         install_docker()
 
     if install_components['sylkserver']:
-        make_step("Get certificate")
+        make_step("Install Sylk-suite")
         start_sylk_suite(data)
 
     if install_components['opensips']:
