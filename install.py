@@ -375,9 +375,9 @@ def start_sylk_suite(data):
         pass
 
     if regenerate:
-        run("docker-compose build --no-cache webrtc", cwd=dest_dir, silent=true)
+        run("docker-compose build --no-cache webrtc", cwd=DEST_DIR, silent=True)
 
-    run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=dest_dir, silent=true)
+    run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=DEST_DIR, silent=True)
     # update_sylk_config(data)
     output("Sylk Server abd Janus server installed")
 
