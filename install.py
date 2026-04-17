@@ -75,7 +75,20 @@ env['DEBIAN_FRONTEND'] = "noninteractive"
 
 
 class Info():
-    DEFAULT_FILE='.env'
+    # Persistent settings live next to the other installer artefacts in the
+    # repository's logs directory. The old `.env` files (either the one the
+    # installer used to drop inside DEST_DIR, or the one produced when the
+    # script was run from a different working directory) are kept as a
+    # one-shot migration source in load() below. Order matters: the copy
+    # inside DEST_DIR is considered authoritative, since it's the one that
+    # corresponds to the currently-deployed installation.
+    DEFAULT_FILE = str(DEST_DIR / "logs" / "setup.json")
+    LEGACY_ENV_FILES = (
+        str(DEST_DIR / ".env"),   # authoritative: matches the running deploy
+        ".env",                    # fallback: installer's current directory
+    )
+    # Kept for backward compatibility with external callers / --purge-files
+    LEGACY_ENV_FILE = ".env"
 
     def __init__(self, email, zone, ip_addr, local_ip, nat, web_port, sip_port, rtp_port, msrp_port):
         self.email = email
@@ -109,54 +122,119 @@ class Info():
 
     def save(self, filename=None):
         filename = filename or self.DEFAULT_FILE
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(f"IP={self.ip}\n")
-            f.write(f"FULL_DOMAIN={self.zone}.{DOMAIN}\n")
-            f.write(f"EMAIL={self.email}\n")
-            f.write(f"NAT={str(self.nat)}\n")
-            f.write(f"LOCAL_IP={self.local_ip}\n")
-            f.write(f"WEB_PORT={self.web_port}\n")
-            f.write(f"SIP_PORT={self.sip_port}\n")
-            f.write(f"RTP_PORT={self.rtp_port}\n")
-            f.write(f"MSRP_PORT={self.msrp_port}\n")
+        parent = os.path.dirname(filename)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        payload = {
+            "email":       self.email,
+            "full_domain": f"{self.zone}.{DOMAIN}",
+            "zone":        self.zone,
+            "ip":          self.ip,
+            "local_ip":    self.local_ip,
+            "nat":         self.nat,
+            "web_port":    self.web_port,
+            "sip_port":    self.sip_port,
+            "rtp_port":    self.rtp_port,
+            "msrp_port":   self.msrp_port,
+        }
+        # Write atomically so an interrupted write cannot leave a half-file.
+        tmp = filename + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, filename)
+
+    @classmethod
+    def _from_dict(cls, data):
+        full_domain = data.get("full_domain") or ""
+        ip = data.get("ip")
+
+        # Placeholder/sentinel values mean "not yet configured".
+        if full_domain == "sylk.link" and ip == "0.0.0.0":
+            return None
+        if not full_domain:
+            return None
+
+        zone = data.get("zone") or full_domain.split(".")[0]
+        return cls(
+            email=data.get("email"),
+            zone=zone,
+            ip_addr=None,
+            local_ip=data.get("local_ip"),
+            nat=data.get("nat"),
+            web_port=data.get("web_port"),
+            sip_port=data.get("sip_port"),
+            rtp_port=data.get("rtp_port"),
+            msrp_port=data.get("msrp_port"),
+        )
+
+    @classmethod
+    def _load_legacy_env(cls, filename):
+        """Parse a legacy KEY=VALUE .env file into a dict compatible with _from_dict."""
+        env_data = {}
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    env_data[key] = value
+        return {
+            "email":       env_data.get("EMAIL"),
+            "full_domain": env_data.get("FULL_DOMAIN"),
+            "ip":          env_data.get("IP"),
+            "local_ip":    env_data.get("LOCAL_IP"),
+            "nat":         env_data.get("NAT"),
+            "web_port":    env_data.get("WEB_PORT"),
+            "sip_port":    env_data.get("SIP_PORT"),
+            "rtp_port":    env_data.get("RTP_PORT"),
+            "msrp_port":   env_data.get("MSRP_PORT"),
+        }
 
     @classmethod
     def load(cls, filename=None):
         filename = filename or cls.DEFAULT_FILE
 
-        if not os.path.exists(filename):
-            return None
+        # Preferred: JSON settings file.
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return None
+            return cls._from_dict(data)
 
-        env_data = {}
-        with open(filename, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    key, value = line.split("=", 1)
-                    env_data[key] = value
+        # One-shot migration from a legacy .env file. We look first in
+        # DEST_DIR (the authoritative copy the previous installer runs
+        # dropped alongside docker-compose.yml) and then fall back to a .env
+        # in the current working directory — which is what the user ends up
+        # with when they download install.py into some other folder and run
+        # it from there. After we successfully read it, persist to the new
+        # JSON location and delete the legacy file so subsequent runs use
+        # the new path.
+        for legacy in cls.LEGACY_ENV_FILES:
+            if not os.path.exists(legacy):
+                continue
+            try:
+                data = cls._load_legacy_env(legacy)
+            except OSError:
+                continue
+            info = cls._from_dict(data)
+            if info is None:
+                # Corrupt / placeholder legacy file; try the next candidate.
+                continue
+            try:
+                info.save(filename)
+                os.remove(legacy)
+                output(f"Migrated legacy settings from {legacy} to {filename}")
+            except OSError:
+                # Migration is best-effort; if the target dir does not
+                # exist yet (first run before clone_repo) we'll retry on
+                # the next save call.
+                pass
+            return info
 
-        if env_data.get("FULL_DOMAIN") == 'sylk.link' and env_data.get("IP") == '0.0.0.0':
-            return None
-
-        if env_data.get("FULL_DOMAIN", None) is None:
-            return None
-
-        ip = env_data.get("IP")
-        full_domain = env_data.get("FULL_DOMAIN")
-        email = env_data.get("EMAIL")
-
-        if full_domain == '':
-            return None
-
-        zone = full_domain.split(".")[0] if full_domain else ""
-        nat = env_data.get("NAT")
-        local_ip = env_data.get("LOCAL_IP")
-        web_port = env_data.get("WEB_PORT")
-        sip_port = env_data.get("SIP_PORT")
-        rtp_port = env_data.get("RTP_PORT")
-        msrp_port = env_data.get("MSRP_PORT")
-
-        return cls(email=email, zone=zone, ip_addr=None, local_ip=local_ip, nat=nat, web_port=web_port, sip_port=sip_port, rtp_port=rtp_port, msrp_port=msrp_port)
+        return None
 
     def __str__(self):
         fields = [
@@ -838,8 +916,16 @@ def create_domain(data):
         sys.exit(1)
 
 
-def setup_data(data=None):
-    # print("Installing Sylk Suite...")
+def _ask_all_settings(data=None):
+    """
+    STEP 1 questions. Returns a freshly-constructed Info instance.
+    If `data` is provided its fields are used as the defaults for each prompt.
+    """
+    global step
+    # Reset so question() prints the STEP 1 header when we re-enter this
+    # block after a "no" at the confirmation step.
+    step = 0
+
     while True:
         email = question(1, "Sylk Suite installation data", "Enter your email address", default=data.email if data else 'support@ag-projects.com')
         if is_valid_email(email):
@@ -952,6 +1038,14 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     if not skip_git:
         make_step("Clone repository")
         clone_repo()
+
+    # Persist the gathered settings once DEST_DIR (and therefore the logs/
+    # directory) can safely exist. This replaces the old `.env` file.
+    try:
+        data.save()
+        output(f"Settings saved to {data.DEFAULT_FILE}")
+    except OSError as e:
+        error(f"Could not write settings file: {e}")
 
     if install_components['dns']:
         make_step("Create DNS zone")
