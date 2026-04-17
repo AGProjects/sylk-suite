@@ -16,7 +16,18 @@ from time import sleep
 from urllib import error as urlerror
 from urllib import request
 
-EMAIL_REGEX = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
+# Practical email syntactic check. Not a full RFC 5322 parser — it enforces
+# the things users actually get wrong:
+#   - exactly one @ separator
+#   - no whitespace anywhere
+#   - non-empty local part, only RFC-5322-common chars, no leading/trailing
+#     dot and no consecutive dots
+#   - domain made of at least two DNS labels, each 1-63 chars, alphanumerics
+#     and hyphens only (no leading/trailing hyphen)
+#   - TLD of at least 2 letters (alphabetic)
+_EMAIL_LOCAL_RE  = re.compile(r"^[A-Za-z0-9._%+\-]+$")
+_EMAIL_LABEL_RE  = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+_EMAIL_TLD_RE    = re.compile(r"^[A-Za-z]{2,}$")
 
 REPO_URL = "https://github.com/AGProjects/sylk-suite.git"
 DEST_DIR = Path("/opt/sylk-suite")
@@ -383,7 +394,27 @@ def check_command(cmd):
 
 
 def is_valid_email(email):
-    return bool(EMAIL_REGEX.match(email))
+    if not email or len(email) > 254 or any(c.isspace() for c in email):
+        return False
+    parts = email.split("@")
+    if len(parts) != 2:
+        return False
+    local, domain = parts
+    if not local or len(local) > 64:
+        return False
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return False
+    if not _EMAIL_LOCAL_RE.match(local):
+        return False
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not _EMAIL_LABEL_RE.match(label):
+            return False
+    if not _EMAIL_TLD_RE.match(labels[-1]):
+        return False
+    return True
 
 
 def is_valid_subdomain(name):
