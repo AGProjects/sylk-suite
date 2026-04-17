@@ -39,37 +39,58 @@ RESULT_PREFIX = "dns-data"
 
 ALLOWED_COMPONENTS = {"opensips", "sylkserver", "mediaproxy", "openxcap", "msrprelay", "dns", "enrollment", "docker", "mysql"}
 
-# Debian packages explicitly installed by this script. Keep this list in sync
-# with the install_* functions below; it drives --show-installed and
-# --purge-files.
-INSTALLED_DEB_PACKAGES = [
+# Debian packages this script `apt-get install`s fall into two groups:
+#
+# PROJECT_DEB_PACKAGES — project-specific packages that are safe to
+#   purge on --purge-files. These are either our own (opensips*,
+#   mediaproxy*, msrprelay, openxcap) or the Docker stack / small
+#   utilities we pull in explicitly.
+#
+# SYSTEM_DEB_DEPENDENCIES — foundational system packages the installer
+#   needs but that are commonly pre-installed on Debian/Ubuntu and are
+#   depended on by many other things on the host. Removing these would
+#   break other software (and in the case of ca-certificates would even
+#   break Python HTTPS on this very installer). --purge-files intentionally
+#   leaves these alone; --show-installed lists them so the user can see
+#   exactly what the installer touched. Use --reinstall-deps to repair
+#   these if they have been removed by an older version of this script.
+PROJECT_DEB_PACKAGES = [
     # Baseline utilities (main)
     "python3-psutil",
-    "apt-utils",
-    "joe",
-    "ngrep",
-    "tcpdump",
     "qrencode",
     # Docker stack (install_docker)
-    "ca-certificates",
-    "curl",
-    "gnupg",
     "docker.io",
     "docker-compose",
-    # Repo tooling (clone_repo)
-    "git",
     # OpenSIPS stack (install_opensips). The meta-package pulls in the rest;
     # we still list them explicitly so --show-installed reports them and
-    # --purge-files removes them by name (not just via autoremove).
+    # --purge-files removes them by name.
     "opensips-config-sylkserver",
     "opensips",
     "mediaproxy-dispatcher",
     "mediaproxy-relay",
     "msrprelay",
-    "certbot",
+    # Note: certbot is NOT a host Debian package in this setup — it runs
+    # inside the `certbot/certbot` Docker container built from
+    # certbot/Dockerfile, so it is tracked in DOCKER_IMAGES below rather
+    # than here. The project's scripts/uninstall.sh lists `certbot` as a
+    # defensive apt-remove in case someone also installed the host
+    # package manually, but the installer itself never does.
     # OpenXCAP (install_openxcap)
     "openxcap",
 ]
+
+SYSTEM_DEB_DEPENDENCIES = [
+    "ca-certificates",  # system CA bundle — also used by Python's urllib
+    "apt-utils",
+    "curl",
+    "gnupg",
+    "git",
+]
+
+# Back-compat alias: kept so anything that still references the old name
+# (tests, external tooling) keeps working. New code should reference the
+# split lists directly.
+INSTALLED_DEB_PACKAGES = PROJECT_DEB_PACKAGES + SYSTEM_DEB_DEPENDENCIES
 
 # Third-party APT sources and GPG keyrings added by this script.
 INSTALLED_APT_SOURCES = [
@@ -354,7 +375,20 @@ def make_step(msg, step_color=CYAN):
     print(f"{step_color}[STEP {step}] {msg}{RESET}")
 
 
-def run(cmd, cwd=None, silent=False, echo=True):
+def run(cmd, cwd=None, silent=False, echo=True, check=True):
+    """
+    Run `cmd` (shell command) with captured stdout/stderr (merged).
+
+    - `silent=True` suppresses live streaming while the command runs BUT
+      will print the captured output if the command fails, so that failure
+      diagnostics are not lost. Previously a silent failure only printed
+      "Command failed!" with zero context, which made problems like a
+      failed `git pull` impossible to diagnose from the terminal.
+    - `echo=False` suppresses the `>>> cmd` banner.
+    - `check=True` (the default, preserving old behaviour) makes this
+      sys.exit() on non-zero status. Pass `check=False` to get the captured
+      output back instead of exiting.
+    """
     if not silent and echo:
         print(f"{BLUE}>>> {cmd}{RESET}")
     process = subprocess.Popen(
@@ -1368,11 +1402,27 @@ def purge_files():
         except OSError as e:
             error(f"Could not remove {nf_file}: {e}")
 
-    # And the persistent settings file (both the current JSON location and
-    # any leftover legacy .env files from older installs, in DEST_DIR or the
-    # script's current working directory).
+    # Persistent settings files. We deliberately leave anything under
+    # DEST_DIR alone — the user is expected to remove /opt/sylk-suite/
+    # themselves (it's the cloned repo checkout, not something the
+    # installer should delete on their behalf). We only clean up the
+    # legacy `.env` that may be sitting in the installer's current
+    # working directory from an older run.
+    dest_abs = os.path.realpath(str(DEST_DIR))
+
+    def _under_destdir(path):
+        try:
+            return os.path.realpath(path).startswith(dest_abs + os.sep)
+        except OSError:
+            return False
+
     for path in (Info.DEFAULT_FILE, *Info.LEGACY_ENV_FILES):
-        if path and os.path.exists(path):
+        if not path:
+            continue
+        if _under_destdir(path):
+            # Intentionally skipped; the user will delete DEST_DIR manually.
+            continue
+        if os.path.exists(path):
             try:
                 os.remove(path)
                 output(f"Removed {path}")
@@ -1443,7 +1493,7 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         error("Please run this script with sudo or as root")
         sys.exit(1)
 
-    os.system('apt-get install -qq -y python3-psutil apt-utils joe ngrep tcpdump> /dev/null')
+    os.system('apt-get install -qq -y python3-psutil apt-utils > /dev/null')
     os.system('echo "options nf_conntrack enable_hooks=1" | sudo tee /etc/modprobe.d/nf_conntrack.conf > /dev/null')
 
     print("""

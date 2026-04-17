@@ -40,9 +40,5 @@ Use this installer to self-host a SIP/WEBRTC server under your own domain.
 
 # Uninstall
 
-The software is installed in /opt/sylk-suite.  To remove the installed software
-packages run:
-
-```
-/opt/sylk-suite/scripts/uninstall.sh
-```
+Running the install script with --show-installed will display all installed
+software. Use the purge command to remove the software.
