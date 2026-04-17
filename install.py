@@ -28,6 +28,53 @@ RESULT_PREFIX = "dns-data"
 
 ALLOWED_COMPONENTS = {"opensips", "sylkserver", "mediaproxy", "openxcap", "msrprelay", "dns", "enrollment", "docker", "mysql"}
 
+# Debian packages explicitly installed by this script. Keep this list in sync
+# with the install_* functions below; it drives --show-installed and
+# --purge-files.
+INSTALLED_DEB_PACKAGES = [
+    # Baseline utilities (main)
+    "python3-psutil",
+    "apt-utils",
+    "joe",
+    "ngrep",
+    "tcpdump",
+    "qrencode",
+    # Docker stack (install_docker)
+    "ca-certificates",
+    "curl",
+    "gnupg",
+    "docker.io",
+    "docker-compose",
+    # Repo tooling (clone_repo)
+    "git",
+    # OpenSIPS stack (install_opensips). The meta-package pulls in the rest;
+    # we still list them explicitly so --show-installed reports them and
+    # --purge-files removes them by name (not just via autoremove).
+    "opensips-config-sylkserver",
+    "opensips",
+    "mediaproxy-dispatcher",
+    "mediaproxy-relay",
+    "msrprelay",
+    "certbot",
+    # OpenXCAP (install_openxcap)
+    "openxcap",
+]
+
+# Third-party APT sources and GPG keyrings added by this script.
+INSTALLED_APT_SOURCES = [
+    "/etc/apt/sources.list.d/ag-projects.list",
+    "/etc/apt/sources.list.d/opensips.list",
+    "/etc/apt/sources.list.d/opensips-cli.list",
+    "/usr/share/keyrings/agp-debian-key.gpg",
+    "/usr/share/keyrings/opensips-org.gpg",
+]
+
+# Docker resources declared in the bundled docker-compose.yml.
+DOCKER_CONTAINERS = ["sylkserver", "janus", "sylk-webrtc"]
+DOCKER_IMAGES = ["sylkserver:bookworm", "sylk-webrtc-nginx", "certbot/certbot"]
+DOCKER_VOLUMES = ["sylkserver_tls"]
+DOCKER_NETWORKS = ["sylk-net"]
+
 starts = ["bl", "sn", "fl", "zo", "qu", "pl", "gr", "dr", "tr", "wh", "kr", "gl", "sp", "tw"]
 middles = ["a", "e", "i", "o", "u", "ai", "oo", "ee"]
 ends = ["b", "p", "d", "t", "g", "nk", "sh", "mp", "zz"]
@@ -667,6 +714,9 @@ def install_opensips(data, mysql=True, force_mysql=False):
         pass
 
     output("OpenSIPS installed")
+    output("OpenSIPS routing logic: /etc/opensips/config/opensips.m4")
+    output("OpenSIPS configuration: /etc/opensips/config/setting.m4")
+    output("Run sudo /usr/sbin/opensips-config after changing the m4 files")
 
 
 def install_mediaproxy(data):
@@ -1067,20 +1117,294 @@ def _ask_all_settings(data=None):
         nat = True
         local_ip = _pick_private_ip(data.local_ip if data else None)
 
-    data = Info(email, silly_subdomain, ip_addr, local_ip, nat, web_port, sip_port, rtp_port, msrp_port)
+    return Info(email, silly_subdomain, ip_addr, local_ip, nat, web_port, sip_port, rtp_port, msrp_port)
 
-    correct = question(
-        2,
-        "Confirm Sylk Suite installation",
-        f"\n{str(data)}\n\nContinue with the following settings?",
-        default="Y"
-    ).lower()
 
-    if correct not in ("", "y", "yes"):
-        setup_data(data)
-    data.save()
+def setup_data(data=None):
+    # If a previous run left us a setup.json, jump straight to STEP 2 so the
+    # user can confirm the saved settings without walking through every
+    # question again. They can opt into the full STEP 1 flow by answering
+    # "n" to the confirmation.
+    if data is not None:
+        shortcut = question(
+            2,
+            "Confirm Sylk Suite installation",
+            f"\n{str(data)}\n\nContinue with these saved settings (no changes)?",
+            default="Y",
+        ).lower()
+        if shortcut in ("", "y", "yes"):
+            # Note: the settings file (logs/setup.json) lives inside DEST_DIR,
+            # so save() is deferred until main() has run clone_repo(). No
+            # write happens here.
+            return data
+        # Otherwise: fall through into the full STEP 1 flow, using the saved
+        # values as defaults for each prompt.
 
-    return data
+    # STEP 1 + STEP 2 confirmation loop. Re-prompt on "no" by reusing the
+    # just-entered values as defaults.
+    while True:
+        data = _ask_all_settings(data)
+
+        correct = question(
+            2,
+            "Confirm Sylk Suite installation",
+            f"\n{str(data)}\n\nContinue with the following settings?",
+            default="Y",
+        ).lower()
+
+        if correct in ("", "y", "yes"):
+            return data
+        # Loop: re-ask STEP 1 with data as defaults
+
+
+def _pkg_installed(pkg):
+    """Return True if a Debian package is currently installed."""
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", pkg],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0 and "install ok installed" in result.stdout
+
+
+def _docker_available():
+    return check_command("docker")
+
+
+def _docker_inspect(kind, name, fmt):
+    """Run `docker <kind> inspect --format <fmt> <name>`; return stdout or None."""
+    if kind == "container":
+        cmd = ["docker", "inspect", "--format", fmt, name]
+    elif kind == "image":
+        cmd = ["docker", "image", "inspect", "--format", fmt, name]
+    elif kind == "volume":
+        cmd = ["docker", "volume", "inspect", "--format", fmt, name]
+    elif kind == "network":
+        cmd = ["docker", "network", "inspect", "--format", fmt, name]
+    else:
+        return None
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return None
+
+
+def show_installed():
+    """Report Debian packages installed by this script and Docker resource locations."""
+    print("")
+    print(f"{CYAN}Debian packages explicitly installed by this script{RESET}")
+    print("-" * 80)
+    for pkg in INSTALLED_DEB_PACKAGES:
+        if _pkg_installed(pkg):
+            ver = subprocess.run(
+                ["dpkg-query", "-W", "-f=${Version}", pkg],
+                capture_output=True, text=True
+            ).stdout.strip()
+            print(f"    {pkg:<35} {GREEN}installed{RESET}  {ver}")
+        else:
+            print(f"    {pkg:<35} {YELLOW}not installed{RESET}")
+
+    print("")
+    print(f"{CYAN}APT sources and keyrings added by this script{RESET}")
+    print("-" * 80)
+    for path in INSTALLED_APT_SOURCES:
+        if os.path.exists(path):
+            print(f"    {path:<55} {GREEN}present{RESET}")
+        else:
+            print(f"    {path:<55} {YELLOW}absent{RESET}")
+
+    print("")
+    print(f"{CYAN}Docker containers (from {DEST_DIR}/docker-compose.yml){RESET}")
+    print("-" * 80)
+    if not _docker_available():
+        print(f"    {YELLOW}docker is not installed{RESET}")
+    else:
+        for c in DOCKER_CONTAINERS:
+            state = _docker_inspect("container", c, "{{.State.Status}}")
+            root = _docker_inspect("container", c, "{{.GraphDriver.Data.MergedDir}}") or ""
+            if state is None:
+                print(f"    {c:<20} {YELLOW}not present{RESET}")
+            else:
+                print(f"    {c:<20} state={state}")
+                if root:
+                    print(f"    {'':<20}   fs={root}")
+
+        print("")
+        print(f"{CYAN}Docker images{RESET}")
+        print("-" * 80)
+        for img in DOCKER_IMAGES:
+            iid = _docker_inspect("image", img, "{{.Id}}")
+            upper = _docker_inspect("image", img, "{{.GraphDriver.Data.UpperDir}}") or ""
+            if iid is None:
+                print(f"    {img:<30} {YELLOW}not present{RESET}")
+            else:
+                short = iid.split(":", 1)[-1][:12]
+                print(f"    {img:<30} id={short}")
+                if upper:
+                    print(f"    {'':<30}   upper={upper}")
+
+        print("")
+        print(f"{CYAN}Docker volumes{RESET}")
+        print("-" * 80)
+        for vol in DOCKER_VOLUMES:
+            found = False
+            # docker-compose v1 prefixes volumes with the project dir basename
+            for name in (vol, f"{DEST_DIR.name}_{vol}"):
+                mp = _docker_inspect("volume", name, "{{.Mountpoint}}")
+                if mp:
+                    print(f"    {name:<30} mountpoint={mp}")
+                    found = True
+                    break
+            if not found:
+                print(f"    {vol:<30} {YELLOW}not present{RESET}")
+
+        print("")
+        print(f"{CYAN}Docker networks{RESET}")
+        print("-" * 80)
+        for net in DOCKER_NETWORKS:
+            found = False
+            for name in (net, f"{DEST_DIR.name}_{net}"):
+                scope = _docker_inspect("network", name, "{{.Scope}}/{{.Driver}}")
+                if scope:
+                    print(f"    {name:<30} {scope}")
+                    found = True
+                    break
+            if not found:
+                print(f"    {net:<30} {YELLOW}not present{RESET}")
+
+        root = subprocess.run(
+            ["docker", "info", "--format", "{{.DockerRootDir}}"],
+            capture_output=True, text=True
+        ).stdout.strip()
+        if root:
+            print("")
+            print(f"{CYAN}Docker root directory{RESET}: {root}")
+
+    print("")
+    print(f"{CYAN}Repository location{RESET}: {DEST_DIR}  "
+          f"({'present' if DEST_DIR.exists() else 'absent'})")
+    print("")
+
+
+def purge_files():
+    """Uninstall all Debian packages and APT sources added by this script."""
+    if os.geteuid() != 0:
+        error("Please run this script with sudo or as root")
+        sys.exit(1)
+
+    installed = [p for p in INSTALLED_DEB_PACKAGES if _pkg_installed(p)]
+    if installed:
+        make_step(f"Purging {len(installed)} Debian package(s) installed by this script")
+        pkg_list = " ".join(installed)
+        # Stop the services first so purge can remove their units cleanly.
+        for svc in ("opensips", "mediaproxy-dispatcher", "mediaproxy-relay",
+                    "msrprelay", "openxcap", "enrollment", "docker"):
+            subprocess.run(["systemctl", "stop", svc],
+                           capture_output=True, text=True)
+        # Use subprocess.run so a non-zero exit (e.g. a package that vanished
+        # mid-purge) does not abort the whole cleanup.
+        subprocess.run(
+            f"apt-get purge -y -qq {pkg_list}",
+            shell=True, env=env
+        )
+        subprocess.run(
+            "apt-get autoremove -y -qq --purge",
+            shell=True, env=env
+        )
+        output("Packages purged (dependencies autoremoved)")
+    else:
+        output("No tracked Debian packages are currently installed")
+
+    make_step("Removing APT sources and keyrings added by this script")
+    removed_any = False
+    for path in INSTALLED_APT_SOURCES:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                output(f"Removed {path}")
+                removed_any = True
+            except OSError as e:
+                error(f"Could not remove {path}: {e}")
+        else:
+            output(f"Not present: {path}")
+
+    # Also clean up the nf_conntrack modprobe file the installer drops.
+    nf_file = "/etc/modprobe.d/nf_conntrack.conf"
+    if os.path.exists(nf_file):
+        try:
+            os.remove(nf_file)
+            output(f"Removed {nf_file}")
+            removed_any = True
+        except OSError as e:
+            error(f"Could not remove {nf_file}: {e}")
+
+    # And the persistent settings file (both the current JSON location and
+    # any leftover legacy .env files from older installs, in DEST_DIR or the
+    # script's current working directory).
+    for path in (Info.DEFAULT_FILE, *Info.LEGACY_ENV_FILES):
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+                output(f"Removed {path}")
+                removed_any = True
+            except OSError as e:
+                error(f"Could not remove {path}: {e}")
+
+    if removed_any:
+        subprocess.run("apt-get update -qq", shell=True, env=env)
+
+    output("Debian package purge complete")
+
+
+def purge_docker_files():
+    """Remove Docker containers, images, volumes and networks created by this script."""
+    if os.geteuid() != 0:
+        error("Please run this script with sudo or as root")
+        sys.exit(1)
+
+    if not _docker_available():
+        error("Docker is not installed; nothing to remove")
+        return
+
+    compose_file = DEST_DIR / "docker-compose.yml"
+    if compose_file.exists():
+        make_step("Tearing down docker-compose stack")
+        # -v removes named volumes, --rmi all removes both built and pulled
+        # images referenced by the compose file, --remove-orphans cleans up
+        # containers that used to be in the compose file.
+        subprocess.run(
+            "docker-compose down -v --rmi all --remove-orphans",
+            shell=True, cwd=str(DEST_DIR), env=env
+        )
+    else:
+        output(f"No docker-compose.yml at {DEST_DIR}; cleaning resources by name")
+
+    make_step("Removing any leftover containers")
+    for c in DOCKER_CONTAINERS:
+        if _docker_inspect("container", c, "{{.Id}}"):
+            subprocess.run(f"docker rm -f {c}", shell=True, env=env)
+            output(f"Removed container {c}")
+
+    make_step("Removing any leftover images")
+    for img in DOCKER_IMAGES:
+        if _docker_inspect("image", img, "{{.Id}}"):
+            subprocess.run(f"docker image rm -f {img}", shell=True, env=env)
+            output(f"Removed image {img}")
+
+    make_step("Removing any leftover named volumes")
+    for vol in DOCKER_VOLUMES:
+        for name in (vol, f"{DEST_DIR.name}_{vol}"):
+            if _docker_inspect("volume", name, "{{.Name}}"):
+                subprocess.run(f"docker volume rm -f {name}", shell=True, env=env)
+                output(f"Removed volume {name}")
+
+    make_step("Removing any leftover networks")
+    for net in DOCKER_NETWORKS:
+        for name in (net, f"{DEST_DIR.name}_{net}"):
+            if _docker_inspect("network", name, "{{.Id}}"):
+                subprocess.run(f"docker network rm {name}", shell=True, env=env)
+                output(f"Removed network {name}")
+
+    output("Docker images, containers, volumes and networks removed")
 
 
 def main(components, exclude_components, force_mysql=False, skip_git=False):
@@ -1199,6 +1523,8 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     make_step("Mobile app enrollment")
     os.system(f"qrencode -t ansiutf8 {data.full_domain}")
 
+    output("Backup /opt/sylk-suite/logs folder, it contains your setup and Managed DNS credentials")
+
 
 def parse_components(value):
     components = [c.strip() for c in value.split(",") if c.strip()]
@@ -1241,9 +1567,46 @@ if __name__ == "__main__":
         default=False,
         help="Skip cloning or pulling the repository (use existing local copy)"
     )
+    parser.add_argument(
+        "--show-installed",
+        action="store_true",
+        default=False,
+        help="Show the Debian packages installed by this script and the "
+             "locations of the Docker images, containers and volumes it created"
+    )
+    parser.add_argument(
+        "--purge-files",
+        action="store_true",
+        default=False,
+        help="Uninstall every Debian package and APT source added by this "
+             "script (apt-get purge + autoremove). Does not touch Docker."
+    )
+    parser.add_argument(
+        "--purge-docker-files",
+        action="store_true",
+        default=False,
+        help="Remove the Docker containers, images, volumes and networks "
+             "created by this script (docker-compose down -v --rmi all)."
+    )
 
     try:
         args = parser.parse_args()
+
+        # Maintenance actions run standalone and then exit; they do not
+        # trigger the interactive installer.
+        if args.show_installed:
+            show_installed()
+            sys.exit(0)
+
+        if args.purge_docker_files or args.purge_files:
+            # Tear down Docker first so package purge does not leave orphan
+            # containers bound to docker.io.
+            if args.purge_docker_files:
+                purge_docker_files()
+            if args.purge_files:
+                purge_files()
+            sys.exit(0)
+
         main(args.include, args.exclude, force_mysql=args.force_mysql, skip_git=args.skip_git)
 
     except KeyboardInterrupt:
