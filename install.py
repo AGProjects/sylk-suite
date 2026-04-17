@@ -160,7 +160,13 @@ class Info():
         return cls(
             email=data.get("email"),
             zone=zone,
-            ip_addr=None,
+            # Previously this was hard-coded to None on the assumption that
+            # setup_data() would always re-prompt and rebuild the Info with
+            # a real public IP. That's no longer true — with a valid
+            # setup.json the confirmation shortcut returns this Info
+            # directly, so we must populate ip_addr from the saved value or
+            # env['IP'] ends up as None and subprocess.Popen crashes.
+            ip_addr=ip,
             local_ip=data.get("local_ip"),
             nat=data.get("nat"),
             web_port=data.get("web_port"),
@@ -340,18 +346,32 @@ def is_valid_subdomain(name):
     return bool(re.match(pattern, name))
 
 
-def get_ips():
+# Interface-name prefixes we don't want to offer as "private server IP"
+# candidates: docker0 and per-network bridges (br-*), veth pairs inside
+# containers, VPN/tun-tap and libvirt/kubernetes bridges.
+_VIRTUAL_IFACE_PREFIXES = (
+    "docker", "br-", "veth", "tun", "tap", "virbr", "cni", "kube", "flannel",
+)
+
+
+def _is_virtual_iface(name):
+    return any(name.startswith(p) for p in _VIRTUAL_IFACE_PREFIXES)
+
+
+def get_ips(skip_virtual=True):
     results = []
     import psutil
 
     for interface, addrs in psutil.net_if_addrs().items():
+        if skip_virtual and _is_virtual_iface(interface):
+            continue
         for addr in addrs:
             if addr.family == socket.AF_INET:
                 ip = addr.address
 
                 ip_obj = ipaddress.ip_address(ip)
 
-                if ip_obj.is_loopback:
+                if ip_obj.is_loopback or ip_obj.is_link_local:
                     continue
                 results.append({
                     "interface": interface,
@@ -360,6 +380,70 @@ def get_ips():
                 })
 
     return results
+
+def _pick_private_ip(preferred=None):
+    """
+    Interactive picker for the private server IP. Lists every private IPv4
+    address psutil reports (skipping loopback, link-local and the Docker /
+    virtual bridges) and lets the user select one by number, or type a
+    custom IP address. Returns the chosen IP as a string.
+    """
+    private_ips = [i for i in get_ips() if i["type"] == "private"]
+
+    if not private_ips:
+        # No sensible candidates detected (e.g. host-only container). Fall
+        # back to a free-form prompt, using the previously-saved value or
+        # 127.0.0.1 as the default.
+        default = preferred or "127.0.0.1"
+        while True:
+            entered = question(1, "", "Private server IP address", default=default).strip()
+            try:
+                ipaddress.ip_address(entered)
+                return entered
+            except ValueError:
+                error("Invalid IP address, please enter a valid IPv4 address.")
+
+    # Show the detected candidates as a numbered list. If the previously
+    # saved value matches one of them, default to that row; otherwise
+    # default to the first entry.
+    default_idx = 1
+    if preferred:
+        for idx, entry in enumerate(private_ips, 1):
+            if entry["ip"] == preferred:
+                default_idx = idx
+                break
+
+    print("")
+    print(f"{YELLOW}Detected private IP addresses on this server:{RESET}")
+    for idx, entry in enumerate(private_ips, 1):
+        marker = " <-- saved" if preferred and entry["ip"] == preferred else ""
+        print(f"    [{idx}] {entry['interface']:<12} {entry['ip']}{marker}")
+
+    while True:
+        choice = question(
+            1, "",
+            f"Select private IP (1-{len(private_ips)} or type a custom IP)",
+            default=str(default_idx),
+        ).strip()
+
+        if not choice:
+            choice = str(default_idx)
+
+        # Numeric selection into the list?
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(private_ips):
+                return private_ips[idx - 1]["ip"]
+            error(f"Number out of range; choose 1-{len(private_ips)} or type an IP address.")
+            continue
+
+        # Otherwise treat the input as a literal IP address.
+        try:
+            ipaddress.ip_address(choice)
+            return choice
+        except ValueError:
+            error("Not a valid IP address; choose a number from the list or type an IPv4 address.")
+
 
 def generate_silly_name(n=2):
     #return "".join(random.choice(starts) + random.choice(middles) + random.choice(ends) for _ in range(n)).lower()
@@ -948,10 +1032,21 @@ def _ask_all_settings(data=None):
 
         error("Invalid Sylk domain, please enter a valid one.")
 
-    with request.urlopen("https://api.ipify.org?format=text") as response:
-        public_ip = response.read().decode()
+    # Always re-detect the public IP rather than defaulting to the cached
+    # value from setup.json: the server's public IP may have changed since
+    # the last run, and the user just pressing Enter should always apply
+    # whatever ipify currently reports. We still show the cached value as a
+    # hint if it differs from what we just detected.
+    try:
+        with request.urlopen("https://api.ipify.org?format=text") as response:
+            public_ip = response.read().decode().strip()
+    except Exception:
+        public_ip = data.ip if data and data.ip else ""
 
-    ip_addr = question(1, "", "Public server IP address", default=data.ip if data and data.ip else public_ip).lower()
+    if data and data.ip and data.ip != public_ip and public_ip:
+        output(f"Public IP changed since last run: cached={data.ip}, detected={public_ip}")
+
+    ip_addr = question(1, "", "Public server IP address", default=public_ip or None).lower()
 
     web_port  = question(1, "", "Public Web Port", default=data.web_port if data else "60000")
     msrp_port = question(1, "", "Public MSRP Port", default=data.msrp_port if data else "60001")
@@ -970,13 +1065,7 @@ def _ask_all_settings(data=None):
     local_ip = ''
     if nat in ("", "y", "yes", "Y") or nat:
         nat = True
-        ips = get_ips()
-        try:
-            private_ips = list(reversed([i for i in ips if i["type"] == "private"]))
-            private_ip = private_ips[0]['ip']
-        except KeyError:
-            private_ip = "127.0.0.1"
-        local_ip = question(1, "", "Private server IP address", default=data.local_ip if data else private_ip).lower()
+        local_ip = _pick_private_ip(data.local_ip if data else None)
 
     data = Info(email, silly_subdomain, ip_addr, local_ip, nat, web_port, sip_port, rtp_port, msrp_port)
 
