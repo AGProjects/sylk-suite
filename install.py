@@ -149,6 +149,11 @@ _stun._udp.DOMAINNAME     600     IN      SRV     0 10 3478 stun1.sipthor.net.
 _sylkserver.DOMAINNAME    600     IN      TXT     https://WEBURL/sylk-config.json"""
 
 step = 0
+# Set by --verbose on the command line. When True, run() ignores the
+# per-call `silent=True` flag and streams every command's output live.
+# This is a global so we don't have to thread the flag through every
+# call site (there are ~70 of them).
+VERBOSE = False
 env = os.environ.copy()
 env['DEBIAN_FRONTEND'] = "noninteractive"
 
@@ -384,11 +389,17 @@ def run(cmd, cwd=None, silent=False, echo=True, check=True):
       diagnostics are not lost. Previously a silent failure only printed
       "Command failed!" with zero context, which made problems like a
       failed `git pull` impossible to diagnose from the terminal.
+      NOTE: the module-level `VERBOSE` flag (set by --verbose on the CLI)
+      forces silent=False for every run() call, so the user can see every
+      command's output live.
     - `echo=False` suppresses the `>>> cmd` banner.
     - `check=True` (the default, preserving old behaviour) makes this
       sys.exit() on non-zero status. Pass `check=False` to get the captured
       output back instead of exiting.
     """
+    # --verbose overrides any per-call silent=True request
+    if VERBOSE:
+        silent = False
     if not silent and echo:
         print(f"{BLUE}>>> {cmd}{RESET}")
     process = subprocess.Popen(
@@ -685,7 +696,7 @@ def clone_repo():
 def start_sylk_suite(data):
     run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR, silent=True)
     run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR, silent=True)
-    run("docker-compose up -d", cwd=DEST_DIR, silent=True)
+    run("docker-compose up -d", cwd=DEST_DIR)
     sleep(1)
     run("chmod +x certbot/hooks/auth.py certbot/hooks/cleanup.py", cwd=DEST_DIR, silent=True)
     # Remove stale certbot lock file left behind by interrupted runs
@@ -1814,9 +1825,25 @@ if __name__ == "__main__":
              "the CA bundle. Use this to recover if an older version of "
              "--purge-files removed these packages."
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Stream every shell command's output live. Overrides the "
+             "per-call silent=True that the installer uses by default, "
+             "so you can see exactly what apt-get, docker, git etc. are "
+             "doing. Useful for debugging installation failures."
+    )
 
     try:
         args = parser.parse_args()
+
+        # Promote --verbose into the module-level flag that run() reads.
+        # Doing this as early as possible means every subsequent run()
+        # call — including those inside the maintenance actions below —
+        # will stream output when the user asked for verbosity.
+        if args.verbose:
+            VERBOSE = True
 
         # Maintenance actions run standalone and then exit; they do not
         # trigger the interactive installer.
