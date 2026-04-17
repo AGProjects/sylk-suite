@@ -409,13 +409,22 @@ def run(cmd, cwd=None, silent=False, echo=True, check=True):
         output_lines.append(line)
 
     process.wait()
+    captured = ''.join(output_lines)
 
     if process.returncode != 0:
         if silent or not echo:
             print(f"{BLUE}>>> {cmd}{RESET}")
-        print(f"{RED}Command failed!{RESET}")
+        # Surface the captured output so the user can see WHY the command
+        # failed (previously this was swallowed when silent=True).
+        if silent and captured.strip():
+            for line in captured.splitlines():
+                if line.strip() and "Reading database" not in line:
+                    print(line)
+        print(f"{RED}Command failed (exit {process.returncode}){RESET}")
+        if not check:
+            return captured
         sys.exit(process.returncode)
-    return ''.join(output_lines)
+    return captured
 
 
 def check_command(cmd):
@@ -492,6 +501,61 @@ def get_ips(skip_virtual=True):
                 })
 
     return results
+
+
+_PUBLIC_IP_SERVICES = (
+    "https://api.ipify.org?format=text",
+    "https://ifconfig.me/ip",
+    "https://ipv4.icanhazip.com",
+)
+
+
+def _detect_public_ip(timeout=5):
+    """
+    Try to detect the public IPv4 of this host.
+
+    Order of attempts:
+      1. A locally-configured public IPv4 address (as reported by get_ips()),
+         which avoids any outbound HTTP call when the host actually owns its
+         public IP.
+      2. A sequence of public lookup services (ipify, ifconfig.me,
+         icanhazip). The first one that returns a syntactically valid IPv4
+         wins.
+
+    Returns a tuple (ip, source, errors):
+      - ip: the detected IPv4 as a string, or None on total failure.
+      - source: a human-readable description of where the address came from,
+                or None when nothing worked.
+      - errors: list of "service: reason" strings for the methods that
+                failed (may be empty even on success).
+    """
+    errors = []
+
+    # Step 1: try locally-assigned public IPs first.
+    try:
+        for entry in get_ips():
+            if entry["type"] == "public":
+                return entry["ip"], f"local interface {entry['interface']}", errors
+    except Exception as e:
+        errors.append(f"local interface scan: {e}")
+
+    # Step 2: fall back to HTTP lookup services.
+    for url in _PUBLIC_IP_SERVICES:
+        try:
+            with request.urlopen(url, timeout=timeout) as response:
+                body = response.read().decode().strip()
+            ipaddress.ip_address(body)  # validates IPv4/IPv6
+            # We only want IPv4 here; reject anything that isn't.
+            if ":" in body:
+                errors.append(f"{url}: returned non-IPv4 address {body}")
+                continue
+            return body, url, errors
+        except (urlerror.URLError, socket.timeout, ValueError, OSError) as e:
+            errors.append(f"{url}: {e}")
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+
+    return None, None, errors
 
 def _pick_private_ip(preferred=None):
     """
@@ -599,14 +663,23 @@ def install_docker():
 
 
 def clone_repo():
+    """
+    Clone the repository once. If the destination already exists, leave it
+    completely alone — no `git pull`, no status check, no touching tracked
+    files. This lets the user apply local edits (for debugging, tweaking
+    configs, etc.) without having them blown away or blocking the next
+    install. To pull updates, the user can run git manually; to start
+    fresh they can delete DEST_DIR and re-run the installer.
+    """
+    if DEST_DIR.exists():
+        output(f"Repo already exists at {DEST_DIR}, leaving it as-is "
+               f"(delete it manually if you want a fresh clone).")
+        return
+
     if not check_command("git"):
         run("apt install -y -qq git", silent=True)
-    if DEST_DIR.exists():
-        output(f"Repo already exists at {DEST_DIR}, pulling latest changes...")
-        run("git pull", cwd=DEST_DIR, silent=True)
-    else:
-        output(f"Cloning repo into {DEST_DIR}...")
-        run(f"git clone {REPO_URL} {DEST_DIR}", silent=True)
+    output(f"Cloning repo into {DEST_DIR}...")
+    run(f"git clone {REPO_URL} {DEST_DIR}", silent=True)
 
 
 def start_sylk_suite(data):
@@ -1150,15 +1223,22 @@ def _ask_all_settings(data=None):
     # Always re-detect the public IP rather than defaulting to the cached
     # value from setup.json: the server's public IP may have changed since
     # the last run, and the user just pressing Enter should always apply
-    # whatever ipify currently reports. We still show the cached value as a
-    # hint if it differs from what we just detected.
-    try:
-        with request.urlopen("https://api.ipify.org?format=text") as response:
-            public_ip = response.read().decode().strip()
-    except Exception:
-        public_ip = data.ip if data and data.ip else ""
+    # whatever we just detected. We still show the cached value as a hint
+    # if it differs from what we just detected, and we surface any detection
+    # failures so the user knows why no default appeared.
+    public_ip, source, detect_errors = _detect_public_ip()
 
-    if data and data.ip and data.ip != public_ip and public_ip:
+    if public_ip:
+        output(f"Detected public IP: {public_ip} (via {source})")
+    else:
+        error("Could not auto-detect public IP. Tried:")
+        for line in detect_errors:
+            error(f"  - {line}")
+        if data and data.ip:
+            output(f"Falling back to previously-saved public IP: {data.ip}")
+            public_ip = data.ip
+
+    if data and data.ip and public_ip and data.ip != public_ip:
         output(f"Public IP changed since last run: cached={data.ip}, detected={public_ip}")
 
     ip_addr = question(1, "", "Public server IP address", default=public_ip or None).lower()
@@ -1255,10 +1335,7 @@ def _docker_inspect(kind, name, fmt):
 
 def show_installed():
     """Report Debian packages installed by this script and Docker resource locations."""
-    print("")
-    print(f"{CYAN}Debian packages explicitly installed by this script{RESET}")
-    print("-" * 80)
-    for pkg in INSTALLED_DEB_PACKAGES:
+    def _print_pkg_row(pkg):
         if _pkg_installed(pkg):
             ver = subprocess.run(
                 ["dpkg-query", "-W", "-f=${Version}", pkg],
@@ -1267,6 +1344,18 @@ def show_installed():
             print(f"    {pkg:<35} {GREEN}installed{RESET}  {ver}")
         else:
             print(f"    {pkg:<35} {YELLOW}not installed{RESET}")
+
+    print("")
+    print(f"{CYAN}Project Debian packages (purged by --purge-files){RESET}")
+    print("-" * 80)
+    for pkg in PROJECT_DEB_PACKAGES:
+        _print_pkg_row(pkg)
+
+    print("")
+    print(f"{CYAN}System dependencies (NOT purged; repair with --reinstall-deps){RESET}")
+    print("-" * 80)
+    for pkg in SYSTEM_DEB_DEPENDENCIES:
+        _print_pkg_row(pkg)
 
     print("")
     print(f"{CYAN}APT sources and keyrings added by this script{RESET}")
@@ -1351,14 +1440,26 @@ def show_installed():
 
 
 def purge_files():
-    """Uninstall all Debian packages and APT sources added by this script."""
+    """Uninstall project Debian packages and remove APT sources added by this
+    script.
+
+    Only packages in PROJECT_DEB_PACKAGES are purged. The foundational
+    system dependencies in SYSTEM_DEB_DEPENDENCIES (ca-certificates, curl,
+    gnupg, apt-utils, git) are intentionally left alone because they are
+    usually needed by other software on the host and removing them can
+    break the system — notably ca-certificates, without which Python's
+    HTTPS (and therefore this installer's public-IP detection) stops
+    working. Likewise `apt-get autoremove` is NOT called: it pulls out
+    orphaned dependencies, which is a blunt instrument that has already
+    caused collateral damage in the field.
+    """
     if os.geteuid() != 0:
         error("Please run this script with sudo or as root")
         sys.exit(1)
 
-    installed = [p for p in INSTALLED_DEB_PACKAGES if _pkg_installed(p)]
+    installed = [p for p in PROJECT_DEB_PACKAGES if _pkg_installed(p)]
     if installed:
-        make_step(f"Purging {len(installed)} Debian package(s) installed by this script")
+        make_step(f"Purging {len(installed)} project Debian package(s)")
         pkg_list = " ".join(installed)
         # Stop the services first so purge can remove their units cleanly.
         for svc in ("opensips", "mediaproxy-dispatcher", "mediaproxy-relay",
@@ -1371,13 +1472,13 @@ def purge_files():
             f"apt-get purge -y -qq {pkg_list}",
             shell=True, env=env
         )
-        subprocess.run(
-            "apt-get autoremove -y -qq --purge",
-            shell=True, env=env
-        )
-        output("Packages purged (dependencies autoremoved)")
+        output("Project packages purged")
+        output("System dependencies (ca-certificates, curl, gnupg, "
+               "apt-utils, git) were left installed on purpose.")
+        output("Run `apt-get autoremove` manually if you want to clean up "
+               "orphaned transitive dependencies.")
     else:
-        output("No tracked Debian packages are currently installed")
+        output("No tracked project Debian packages are currently installed")
 
     make_step("Removing APT sources and keyrings added by this script")
     removed_any = False
@@ -1486,6 +1587,39 @@ def purge_docker_files():
                 output(f"Removed network {name}")
 
     output("Docker images, containers, volumes and networks removed")
+
+
+def reinstall_deps():
+    """Reinstall the SYSTEM_DEB_DEPENDENCIES and refresh the CA bundle.
+
+    Older versions of --purge-files removed foundational packages like
+    ca-certificates, which in turn broke Python HTTPS (public-IP detection,
+    apt's own downloads via HTTPS, curl, etc.). Use this flag to recover.
+    It does an `apt-get install --reinstall` of the exact system packages
+    the installer originally pulls in, then runs update-ca-certificates.
+    """
+    if os.geteuid() != 0:
+        error("Please run this script with sudo or as root")
+        sys.exit(1)
+
+    make_step(f"Reinstalling {len(SYSTEM_DEB_DEPENDENCIES)} system dependencies")
+    pkg_list = " ".join(SYSTEM_DEB_DEPENDENCIES)
+    # apt-get update can use HTTP mirrors so should work even if the CA
+    # bundle is broken; the reinstall then restores it.
+    subprocess.run("apt-get update -qq", shell=True, env=env)
+    rc = subprocess.run(
+        f"apt-get install -y --reinstall -qq {pkg_list}",
+        shell=True, env=env
+    ).returncode
+    if rc != 0:
+        error(f"apt-get install --reinstall exited with {rc}; "
+              "you may need to fix your APT sources first.")
+        sys.exit(rc)
+    # Rebuild the system CA store explicitly in case ca-certificates was
+    # only partially restored (the postinst normally does this, but being
+    # belt-and-braces here costs nothing).
+    subprocess.run("update-ca-certificates --fresh", shell=True, env=env)
+    output("System dependencies reinstalled and CA bundle refreshed")
 
 
 def main(components, exclude_components, force_mysql=False, skip_git=False):
@@ -1659,8 +1793,10 @@ if __name__ == "__main__":
         "--purge-files",
         action="store_true",
         default=False,
-        help="Uninstall every Debian package and APT source added by this "
-             "script (apt-get purge + autoremove). Does not touch Docker."
+        help="Uninstall the project Debian packages and APT sources added "
+             "by this script. Does not touch ca-certificates/curl/gnupg/"
+             "apt-utils/git (they are shared system dependencies) and does "
+             "not run apt-get autoremove. Does not touch Docker."
     )
     parser.add_argument(
         "--purge-docker-files",
@@ -1668,6 +1804,15 @@ if __name__ == "__main__":
         default=False,
         help="Remove the Docker containers, images, volumes and networks "
              "created by this script (docker-compose down -v --rmi all)."
+    )
+    parser.add_argument(
+        "--reinstall-deps",
+        action="store_true",
+        default=False,
+        help="Reinstall the system dependencies the installer relies on "
+             "(ca-certificates, curl, gnupg, apt-utils, git) and refresh "
+             "the CA bundle. Use this to recover if an older version of "
+             "--purge-files removed these packages."
     )
 
     try:
@@ -1677,6 +1822,10 @@ if __name__ == "__main__":
         # trigger the interactive installer.
         if args.show_installed:
             show_installed()
+            sys.exit(0)
+
+        if args.reinstall_deps:
+            reinstall_deps()
             sys.exit(0)
 
         if args.purge_docker_files or args.purge_files:
