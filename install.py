@@ -783,6 +783,368 @@ def clone_repo():
     run(f"git clone {REPO_URL} {DEST_DIR}", silent=True)
 
 
+CONNTRACK_CONF_FILE = "/etc/modprobe.d/nf_conntrack.conf"
+CONNTRACK_CONF_DESIRED = "options nf_conntrack enable_hooks=1\n"
+# Touched after a successful in-place reload so subsequent install.py
+# runs in the same boot session skip the (disruptive) docker restart.
+# /run is tmpfs on Debian, so the marker disappears automatically on
+# reboot, which is exactly what we want.
+CONNTRACK_RELOAD_MARKER = "/run/sylk-suite-conntrack-hooks-reloaded"
+
+
+def _get_boot_time():
+    """Return the POSIX timestamp of the system boot, or None if unknown."""
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+def _conntrack_hooks_effective():
+    """Best-effort: are we confident nf_conntrack was loaded with
+    `enable_hooks=1` in the currently-running kernel?
+
+    Returns a tuple ``(effective, reason)`` so the caller can log *why*
+    the state was (or was not) considered good without having to
+    re-derive the evidence.
+
+    The kernel declares `enable_hooks` with `module_param(..., 0000)`, so
+    `/sys/module/nf_conntrack/parameters/enable_hooks` is NEVER created
+    and we cannot ask the running kernel directly. We have to infer from
+    surrounding filesystem evidence:
+
+      A. We dropped a /run marker after hot-reloading in the current boot
+         session. If it's there, the reload already happened.
+      B. /etc/modprobe.d/nf_conntrack.conf exists with the right content
+         AND its mtime predates the current boot. In that case the kernel
+         would have read it when modprobe first brought nf_conntrack up
+         during early boot.
+
+    Anything else (conf missing, conf newer than boot, module not
+    loaded) means we have to take action to get into the right state.
+    """
+    # (A) marker from a prior run this boot
+    if os.path.exists(CONNTRACK_RELOAD_MARKER):
+        return True, f"marker {CONNTRACK_RELOAD_MARKER} present (reloaded earlier this boot)"
+
+    # (B) conf on disk before this boot AND module already loaded
+    if not os.path.exists(CONNTRACK_CONF_FILE):
+        return False, f"{CONNTRACK_CONF_FILE} does not exist"
+    try:
+        with open(CONNTRACK_CONF_FILE) as f:
+            if f.read() != CONNTRACK_CONF_DESIRED:
+                return False, f"{CONNTRACK_CONF_FILE} has unexpected content"
+    except OSError as e:
+        return False, f"could not read {CONNTRACK_CONF_FILE}: {e}"
+    if not os.path.isdir("/sys/module/nf_conntrack"):
+        return False, "nf_conntrack module is not currently loaded"
+
+    boot_time = _get_boot_time()
+    if boot_time is None:
+        return False, "could not determine boot time from /proc/stat"
+    try:
+        conf_mtime = os.path.getmtime(CONNTRACK_CONF_FILE)
+    except OSError as e:
+        return False, f"could not stat {CONNTRACK_CONF_FILE}: {e}"
+    # The conf must have been on disk *before* the system booted, so the
+    # kernel's module-load would have picked up its options.
+    if conf_mtime < boot_time:
+        return True, (
+            f"conf mtime {int(conf_mtime)} predates boot {boot_time} "
+            "-> kernel would have honored enable_hooks at module load"
+        )
+    return False, (
+        f"conf mtime {int(conf_mtime)} is newer than boot {boot_time} "
+        "-> module was loaded before our option file was in place"
+    )
+
+
+def _loaded_modules():
+    """Return the set of currently-loaded kernel module names (from /proc/modules)."""
+    try:
+        with open("/proc/modules") as f:
+            return {line.split()[0] for line in f if line.strip()}
+    except OSError:
+        return set()
+
+
+def _modules_using(target):
+    """Return the set of currently-loaded modules that use `target`.
+
+    /proc/modules line format:
+        <name> <size> <refcount> <used_by_comma_list_or_minus>
+    The "used_by" list on the line for `target` is exactly what we want
+    -- it's the names of modules the kernel says depend on it (i.e. hold
+    a reference to it), which is the same info `lsmod`'s "Used by"
+    column displays.
+    """
+    try:
+        with open("/proc/modules") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4 or parts[0] != target:
+                    continue
+                used_by = parts[3]
+                if used_by == "-":
+                    return set()
+                return {u for u in used_by.split(",") if u}
+    except OSError:
+        pass
+    return set()
+
+
+def _mark_conntrack_reloaded():
+    try:
+        with open(CONNTRACK_RELOAD_MARKER, "w") as f:
+            f.write("")
+    except OSError:
+        # Not being able to write the marker only costs us a redundant
+        # reload on the next run — never fail the installer for it.
+        pass
+
+
+def ensure_conntrack_hooks_enabled():
+    """Guarantee nf_conntrack is loaded with `enable_hooks=1` so MediaProxy
+    can install NAT entries for RTP flows via NFNETLINK_CONNTRACK.
+
+    Background: MediaProxy's relay inserts conntrack expectations from
+    userspace for every RTP stream it bridges. The kernel's nf_conntrack
+    only registers its hooks in a network namespace when something asks
+    for tracking — normally that's a netfilter rule that uses
+    `ct state`, NAT, etc. For the UDP flows MediaProxy cares about there
+    is no such rule, so the kernel silently tears down the entries
+    MediaProxy inserts, and RTP reverse-path breaks. Loading nf_conntrack
+    with the `enable_hooks=1` module parameter forces the hooks to
+    register unconditionally, which is exactly what we need.
+
+    `enable_hooks` is a module parameter, so it can ONLY be set at module
+    load time. Dropping `options nf_conntrack enable_hooks=1` into
+    /etc/modprobe.d/ handles future boots, but if nf_conntrack was
+    already loaded (docker implicitly loads it the moment its iptables
+    rules materialise), the option is ignored until reboot. This
+    function does the hot-reload in place so the user doesn't have to
+    reboot.
+
+    NOTE on detection: the kernel declares enable_hooks with perm=0, so
+    /sys/module/nf_conntrack/parameters/enable_hooks is NEVER created and
+    we cannot read the current value. See _conntrack_hooks_effective()
+    for the fallback heuristic we use (boot-time vs conf mtime + a /run
+    marker for re-runs in the same boot session).
+
+    The reload sequence is:
+      1. Stop docker (it's the main holder of conntrack via iptables).
+      2. Flush every iptables table so no rule references conntrack.
+      3. modprobe -r the dependent modules, then nf_conntrack itself.
+      4. modprobe nf_conntrack enable_hooks=1.
+      5. Restart docker, which rebuilds its iptables/conntrack state.
+
+    If step 3 or 4 fails (e.g. some other service holds the module open),
+    we surface a clear message asking the user to reboot; nothing gets
+    left in a broken state because docker is always started again at the
+    end.
+    """
+    # Chatty diagnostic lines -- only surfaced when --verbose is on.
+    # The core action/progress lines further down stay unconditional
+    # because when a reload is actually happening the user should see it.
+    def vlog(msg):
+        if VERBOSE:
+            output(msg)
+
+    vlog("Checking nf_conntrack hook state (required for MediaProxy RTP relay)...")
+
+    # 1. Persist the option so future boots pick it up automatically.
+    try:
+        existing = ""
+        if os.path.exists(CONNTRACK_CONF_FILE):
+            with open(CONNTRACK_CONF_FILE) as f:
+                existing = f.read()
+        if existing != CONNTRACK_CONF_DESIRED:
+            with open(CONNTRACK_CONF_FILE, "w") as f:
+                f.write(CONNTRACK_CONF_DESIRED)
+            vlog(f"  wrote {CONNTRACK_CONF_FILE}")
+        else:
+            vlog(f"  {CONNTRACK_CONF_FILE} already has enable_hooks=1")
+    except OSError as e:
+        if os.path.exists("/etc/modprobe.d"):
+            error(f"Could not write {CONNTRACK_CONF_FILE}: {e}")
+        return
+
+    # 2. If evidence says hooks are already effective, skip the disruption.
+    effective, reason = _conntrack_hooks_effective()
+    if effective:
+        vlog(f"  nf_conntrack hooks already effective: {reason}")
+        vlog("  skipping reload (delete "
+             f"{CONNTRACK_RELOAD_MARKER} and re-run if you disagree)")
+        return
+    vlog(f"  reload needed: {reason}")
+
+    # 3. Module not loaded at all -> just load it with the option. Cheap.
+    if not os.path.isdir("/sys/module/nf_conntrack"):
+        vlog("  nf_conntrack not loaded; loading with enable_hooks=1...")
+        run("modprobe nf_conntrack enable_hooks=1", silent=True, echo=False, check=False)
+        _mark_conntrack_reloaded()
+        vlog("  [ok]   nf_conntrack loaded with enable_hooks=1")
+        return
+
+    # 4. Module loaded but options stale -> live-reload (disruptive).
+    output("Reloading nf_conntrack with enable_hooks=1 (needed for MediaProxy RTP relay)...")
+
+    docker_was_active = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "docker"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+    if docker_was_active:
+        # Stop docker.socket too so systemd doesn't immediately revive it
+        # the moment a client reconnects.
+        output("  stopping docker...")
+        run("systemctl stop docker docker.socket", silent=True, echo=False, check=False)
+
+    # Flush every iptables table so no rule references conntrack. Without
+    # this, `modprobe -r nf_conntrack` will fail with "Module nf_conntrack
+    # is in use".
+    output("  flushing iptables rules (filter/nat/mangle/raw)...")
+    for table in ("filter", "nat", "mangle", "raw"):
+        run(f"iptables -t {table} -F", silent=True, echo=False, check=False)
+        run(f"iptables -t {table} -X", silent=True, echo=False, check=False)
+
+    # On Debian 12 `iptables` is actually iptables-nft, and Docker also
+    # creates native nftables tables of its own. `iptables -F` only
+    # touches rules through the compatibility backend -- rules and
+    # tables created via the `nft` command (or via Docker's nft
+    # integration) survive, and they keep xt_nat / nft_chain_nat pinned,
+    # which in turn keeps nf_nat pinned, which keeps nf_conntrack
+    # pinned. Flush the entire nftables ruleset too. Harmless on hosts
+    # without nft installed; destructive only to rules we're about to
+    # recreate via `systemctl start docker` at the end anyway.
+    output("  flushing nftables ruleset...")
+    run("nft flush ruleset", silent=True, echo=False, check=False)
+
+    # Remove the modules that keep nf_conntrack held. Order matters: leaf
+    # modules first, then nf_conntrack itself. Missing/already-unloaded
+    # modules are ignored (check=False).
+    # Every module that can hold an nf_conntrack reference. These fall
+    # into four groups:
+    #   * legacy xt_* iptables matches/targets (xt_CT is the `-j CT`
+    #     target, distinct from xt_conntrack which is `-m conntrack`)
+    #   * legacy iptable_* table modules
+    #   * nft_* chain/target modules — these are the ones Debian 12 uses
+    #     because `iptables` is shimmed onto nftables there, and
+    #     `iptables -F` does NOT unload them; nft_chain_nat in particular
+    #     will keep nf_nat (and thus nf_conntrack) pinned until we
+    #     explicitly remove it
+    #   * the nf_* netfilter helpers
+    # Missing modules are tolerated silently — the subprocess call runs
+    # without `check`, and we iterate one module at a time so an early
+    # failure doesn't abort the rest.
+    leaf_modules = [
+        # Legacy xt_*
+        "xt_CT", "xt_MASQUERADE", "xt_conntrack", "xt_connmark", "xt_nat",
+        "xt_REDIRECT", "xt_NETMAP",
+        # Legacy iptable_*
+        "iptable_nat", "iptable_mangle", "iptable_raw",
+        # nftables backend chains/targets (Debian 12 default)
+        "nft_chain_nat", "nft_masq", "nft_nat",
+        # nf_* helpers
+        "nf_nat_ftp", "nf_nat_redirect", "nf_nat_masquerade", "nf_nat",
+        "nf_conntrack_netlink", "nf_conntrack_ftp",
+        "nf_defrag_ipv4", "nf_defrag_ipv6",
+    ]
+    # `modprobe -r` with multiple modules stops at the first failure, so
+    # remove them one by one to maximise how much we can unload. Two
+    # passes: the first does the bulk of the work; the second catches
+    # modules that became unloadable after their users were removed in
+    # pass 1 (e.g. nf_nat frees up once xt_nat is gone).
+    output("  unloading dependent modules:")
+    def _try_rmmod(mod):
+        rc = subprocess.run(
+            ["modprobe", "-r", mod],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        return rc.returncode, (rc.stderr or b"").decode("utf-8", "replace").strip()
+
+    # Pass 1 -- everyone gets a shot, in order.
+    still_loaded = []
+    for mod in leaf_modules:
+        if mod not in _loaded_modules():
+            continue  # Nothing to do; don't log noise for it.
+        code, err = _try_rmmod(mod)
+        if code == 0:
+            output(f"    [ok]   rmmod {mod}")
+        else:
+            still_loaded.append(mod)
+            holders = _modules_using(mod)
+            holder_info = f"held by {', '.join(sorted(holders))}" if holders else (err or "failed")
+            output(f"    [skip] rmmod {mod}: {holder_info}")
+
+    # Pass 2 -- retry only the ones that failed, since pass 1 may have
+    # removed their users. Stop once a full pass makes no progress.
+    while still_loaded:
+        progress = []
+        for mod in still_loaded:
+            if mod not in _loaded_modules():
+                # Someone else's removal took it with them.
+                output(f"    [ok]   {mod} auto-removed")
+                continue
+            code, err = _try_rmmod(mod)
+            if code == 0:
+                output(f"    [ok]   rmmod {mod} (retry)")
+            else:
+                progress.append(mod)
+        if progress == still_loaded:
+            break  # No progress; give up and let the caller report.
+        still_loaded = progress
+
+    # Show what's still holding nf_conntrack before we try to remove it.
+    holders = _modules_using("nf_conntrack")
+    if holders:
+        output(f"  nf_conntrack still held by: {', '.join(sorted(holders))}")
+    else:
+        output("  nf_conntrack has no remaining holders")
+
+    output("  unloading nf_conntrack...")
+    unload = subprocess.run(
+        ["modprobe", "-r", "nf_conntrack"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    if unload.returncode != 0:
+        # Something we didn't account for is still holding the module.
+        err_text = (unload.stderr or b"").decode("utf-8", "replace").strip()
+        still = _modules_using("nf_conntrack")
+        error(f"Could not unload nf_conntrack: {err_text or 'unknown error'}")
+        if still:
+            error(f"  still held by: {', '.join(sorted(still))}")
+            error(f"  (add these to leaf_modules in install.py and re-run)")
+        error("MediaProxy will need a reboot before RTP relay works correctly.")
+        # Restart docker so we don't leave the host without networking.
+        if docker_was_active:
+            run("systemctl start docker", silent=True, echo=False, check=False)
+        return
+
+    output("  [ok]   nf_conntrack unloaded")
+
+    output("  loading nf_conntrack enable_hooks=1...")
+    reload = subprocess.run(
+        ["modprobe", "nf_conntrack", "enable_hooks=1"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    if reload.returncode != 0:
+        err_text = (reload.stderr or b"").decode("utf-8", "replace").strip()
+        error(f"Failed to reload nf_conntrack: {err_text or 'unknown error'}")
+        error("Please reboot before running MediaProxy.")
+    else:
+        output("nf_conntrack reloaded with enable_hooks=1 (no reboot required).")
+        _mark_conntrack_reloaded()
+
+    # Bring docker (and thereby the sylk containers + their iptables rules) back.
+    if docker_was_active:
+        run("systemctl start docker", silent=True, echo=False, check=False)
+
+
 def cleanup_orphan_docker_bridges():
     """Remove docker-created bridge interfaces no longer owned by any
     docker network.
@@ -1045,6 +1407,16 @@ def install_opensips(data, mysql=True, force_mysql=False):
 
 
 def install_mediaproxy(data):
+    # MediaProxy's RTP relay relies on nf_conntrack being loaded with
+    # enable_hooks=1 (see the function's docstring for the full story).
+    # Without this, newly-created conntrack entries are destroyed by the
+    # kernel and the RTP reverse path breaks — the symptom is "RTP works
+    # only after rebooting the machine". Doing this here means we reload
+    # conntrack at the exact point the operator is installing the
+    # component that needs it, rather than at the very top of main()
+    # where docker has not yet been (re)installed.
+    ensure_conntrack_hooks_enabled()
+
     run("cp /usr/share/doc/mediaproxy-common/tls/* /etc/mediaproxy/tls/", silent=True)
 
     config_path = '/etc/mediaproxy/config.ini'
@@ -1815,7 +2187,11 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         sys.exit(1)
 
     os.system('apt-get install -qq -y python3-psutil apt-utils > /dev/null')
-    os.system('echo "options nf_conntrack enable_hooks=1" | sudo tee /etc/modprobe.d/nf_conntrack.conf > /dev/null')
+    # /etc/modprobe.d/nf_conntrack.conf is written (and the running module
+    # hot-reloaded if necessary) by ensure_conntrack_hooks_enabled(), which
+    # runs as part of install_mediaproxy(). Doing it there — rather than
+    # here at the very top — avoids disrupting docker for installer runs
+    # that don't include the mediaproxy component.
 
     print("""
     ███████ ██    ██ ██      ██   ██     ███████ ██    ██ ██ ████████ ███████ 
