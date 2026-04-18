@@ -1258,7 +1258,7 @@ def start_sylk_suite(data):
     run("cp ./webrtc-nginx/domain.conf ./webrtc-nginx/conf/", cwd=DEST_DIR, silent=True)
     run(f"sed -i 's/FULLDOMAIN/{data.full_domain}/g' ./webrtc-nginx/conf/domain.conf", cwd=DEST_DIR, silent=True)
     run("docker exec sylk-webrtc nginx -s reload", silent=True)
-    output("NGINX Web server installed")
+    output("Nginx Web server root folder: %s/webrtc-nginx/html/" % DEST_DIR)
     run("mkdir -p ./webrtc-nginx/html", cwd=DEST_DIR, silent=True)
     regenerate = False
     try:
@@ -1276,7 +1276,8 @@ def start_sylk_suite(data):
         run(compose("up -d"), cwd=DEST_DIR, silent=True)
     run("docker cp sylk-webrtc:/usr/share/nginx/html/. ./webrtc-nginx/html/", cwd=DEST_DIR, silent=True)
     # update_sylk_config(data)
-    output("Sylk Server and Janus server installed")
+    output("SylkServer configuration folder: %s/sylkserver/config/" % DEST_DIR)
+    output("Janus server configuration folder: %s/janus/config/" % DEST_DIR)
 
 
 def install_opensips(data, mysql=True, force_mysql=False):
@@ -2247,7 +2248,7 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         install_docker()
 
     if install_components['sylkserver']:
-        make_step("Install Sylk-suite")
+        make_step("Install SylkSuite")
         start_sylk_suite(data)
 
     if install_components['opensips']:
