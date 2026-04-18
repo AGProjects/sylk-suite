@@ -783,7 +783,94 @@ def clone_repo():
     run(f"git clone {REPO_URL} {DEST_DIR}", silent=True)
 
 
+def cleanup_orphan_docker_bridges():
+    """Remove docker-created bridge interfaces no longer owned by any
+    docker network.
+
+    Every `docker network create` (and every docker-compose run that
+    materialises its declared networks) adds a Linux bridge named
+    br-<network-id[:12]>. `docker network rm` is supposed to delete the
+    bridge too, but if the host crashes mid-teardown — or if the user
+    runs docker-compose from a different working directory and ends up
+    with a second project that creates collidingly-named networks — the
+    kernel keeps the orphan bridge interface forever, usually still
+    claiming the same subnet docker handed out to it originally.
+
+    Symptom when this happens: a fresh container gets IP 172.18.0.2 on
+    its real bridge, but `ip route get 172.18.0.2` resolves to a DEAD
+    orphan bridge that also claims 172.18.0.0/16. docker-proxy then
+    accepts on the published port but its forwarded packets get
+    No-route-to-host, so from outside it looks like "TCP connects, TLS
+    handshake RSTs" while from inside the container everything works.
+
+    This function is safe to call repeatedly: it only deletes interfaces
+    that are (a) named br-<hex>, (b) currently DOWN/no-carrier, and (c)
+    unknown to docker. Anything that's UP — i.e. has live veths attached
+    — is left strictly alone.
+    """
+    if not check_command("docker"):
+        return  # Nothing to clean if docker isn't even installed yet.
+
+    net_dir = "/sys/class/net"
+    try:
+        candidates = [n for n in os.listdir(net_dir) if n.startswith("br-")]
+    except OSError:
+        return
+
+    if not candidates:
+        return
+
+    # Networks docker currently knows about. We compare against the first
+    # 12 characters of the network ID, which is what shows up after the
+    # `br-` prefix in the kernel interface name.
+    captured = run(
+        "docker network ls --no-trunc --format '{{.ID}}'",
+        silent=True, echo=False, check=False,
+    )
+    known_prefixes = {
+        line.strip()[:12] for line in captured.splitlines() if line.strip()
+    }
+
+    removed = []
+    for ifname in candidates:
+        prefix = ifname[len("br-"):]
+        if prefix in known_prefixes:
+            continue  # Live bridge owned by a real docker network.
+
+        # Only touch DOWN bridges. An UP bridge has at least one live veth
+        # attached, which means a real container is using it -- almost
+        # certainly we just misidentified ownership and removing it would
+        # break that container.
+        try:
+            with open(f"{net_dir}/{ifname}/operstate") as f:
+                state = f.read().strip()
+        except OSError:
+            continue
+        if state == "up":
+            continue
+
+        # Use subprocess directly so we can swallow the (usually empty)
+        # output without it cluttering the install log.
+        result = subprocess.run(
+            ["ip", "link", "delete", ifname],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            removed.append(ifname)
+
+    if removed:
+        output(f"Removed {len(removed)} orphan docker bridge(s): {', '.join(removed)}")
+
+
 def start_sylk_suite(data):
+    # Sweep up any docker bridge interfaces left behind by previous
+    # installer runs (especially ones launched from a different cwd).
+    # If an orphan bridge claims the same /16 the new sylk-net is about
+    # to get, the kernel routes container traffic to the dead bridge and
+    # port 60000 stops working -- see cleanup_orphan_docker_bridges().
+    cleanup_orphan_docker_bridges()
+
     run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR, silent=True)
     run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR, silent=True)
     run(compose("up -d"), cwd=DEST_DIR)
