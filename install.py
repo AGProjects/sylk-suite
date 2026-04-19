@@ -1808,7 +1808,19 @@ def _ask_all_settings(data=None):
             public_ip = data.ip
 
     if data and data.ip and public_ip and data.ip != public_ip:
-        output(f"Public IP changed since last run: cached={data.ip}, detected={public_ip}")
+        # Make the IP-change notification impossible to miss. When the
+        # public IP changes (e.g. the cloud instance was stopped and
+        # restarted without an Elastic/static IP), several components
+        # baked the previous value into their config: MediaProxy's
+        # advertised_ip, Janus's nat_1_1_mapping, OpenSIPS's SERVER_IP,
+        # and the DNS records suggested at the end of the installer.
+        # Continuing with this installer run will rewrite all of them
+        # to the new IP, but the operator also has to update the DNS
+        # A record for the domain — otherwise mobile and web clients
+        # will still resolve to the old address and calls will break.
+        print("")
+        print(f"Previous IP : {data.ip}{RESET}")
+        print("")
 
     ip_addr = question(1, "", "Public server IP address", default=public_ip or None).lower()
 
@@ -1839,7 +1851,33 @@ def setup_data(data=None):
     # user can confirm the saved settings without walking through every
     # question again. They can opt into the full STEP 1 flow by answering
     # "n" to the confirmation.
-    if data is not None:
+    #
+    # Before offering the shortcut, probe the public IP. If it has drifted
+    # since last run (very common on cloud instances that don't have an
+    # Elastic/static IP) the shortcut is NOT offered: we fall through into
+    # the full STEP 1 flow so that the warning in _ask_all_settings() fires
+    # and every component is reconfigured with the new IP. Skipping this
+    # check on the shortcut path would let the user unwittingly keep an
+    # outdated IP baked into MediaProxy, Janus, OpenSIPS, etc.
+    skip_shortcut = False
+    if data is not None and data.ip:
+        current_ip, _source, _errs = _detect_public_ip()
+        if current_ip and current_ip != data.ip:
+            output(
+                f"Public IP changed since last install "
+                f"(saved={data.ip}, detected={current_ip}). "
+                "Walking through full setup to reconfigure."
+            )
+            # Skip the shortcut but KEEP `data` so every other saved value
+            # (domain, email, ports, nat, etc.) is still used as the default
+            # in the full STEP 1 flow. Only the IP prompt will show the new
+            # detected value; the rest of the prompts pre-fill with the
+            # values the user confirmed last time. The prominent IP-changed
+            # warning is printed inside _ask_all_settings().
+            skip_shortcut = True
+        # else: IP unchanged (or detection failed) — safe to offer the shortcut.
+
+    if data is not None and not skip_shortcut:
         shortcut = question(
             2,
             "Confirm Sylk Suite installation",
