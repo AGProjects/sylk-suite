@@ -85,6 +85,9 @@ SYSTEM_DEB_DEPENDENCIES = [
     "curl",
     "gnupg",
     "git",
+    "nftables",         # `nft` CLI — needed by ensure_conntrack_hooks_enabled()
+                        # to flush the nftables ruleset before reloading
+                        # nf_conntrack (mediaproxy install step).
 ]
 
 # Back-compat alias: kept so anything that still references the old name
@@ -1416,6 +1419,12 @@ def install_mediaproxy(data):
     # conntrack at the exact point the operator is installing the
     # component that needs it, rather than at the very top of main()
     # where docker has not yet been (re)installed.
+    #
+    # ensure_conntrack_hooks_enabled() calls `nft flush ruleset` as part
+    # of its cleanup, so make sure the nftables user-space CLI is
+    # installed first (it's not present on all minimal Debian/Ubuntu/
+    # Amazon Linux images).
+    run("apt-get install -y -qq nftables > /dev/null", silent=True)
     ensure_conntrack_hooks_enabled()
 
     run("cp /usr/share/doc/mediaproxy-common/tls/* /etc/mediaproxy/tls/", silent=True)
