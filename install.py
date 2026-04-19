@@ -994,7 +994,7 @@ def ensure_conntrack_hooks_enabled():
         return
 
     # 4. Module loaded but options stale -> live-reload (disruptive).
-    output("Reloading nf_conntrack with enable_hooks=1 (needed for MediaProxy RTP relay)...")
+    vlog("Reloading nf_conntrack with enable_hooks=1 (needed for MediaProxy RTP relay)...")
 
     docker_was_active = subprocess.run(
         ["systemctl", "is-active", "--quiet", "docker"],
@@ -1004,13 +1004,13 @@ def ensure_conntrack_hooks_enabled():
     if docker_was_active:
         # Stop docker.socket too so systemd doesn't immediately revive it
         # the moment a client reconnects.
-        output("  stopping docker...")
+        vlog("  stopping docker...")
         run("systemctl stop docker docker.socket", silent=True, echo=False, check=False)
 
     # Flush every iptables table so no rule references conntrack. Without
     # this, `modprobe -r nf_conntrack` will fail with "Module nf_conntrack
     # is in use".
-    output("  flushing iptables rules (filter/nat/mangle/raw)...")
+    vlog("  flushing iptables rules (filter/nat/mangle/raw)...")
     for table in ("filter", "nat", "mangle", "raw"):
         run(f"iptables -t {table} -F", silent=True, echo=False, check=False)
         run(f"iptables -t {table} -X", silent=True, echo=False, check=False)
@@ -1024,7 +1024,7 @@ def ensure_conntrack_hooks_enabled():
     # pinned. Flush the entire nftables ruleset too. Harmless on hosts
     # without nft installed; destructive only to rules we're about to
     # recreate via `systemctl start docker` at the end anyway.
-    output("  flushing nftables ruleset...")
+    vlog("  flushing nftables ruleset...")
     run("nft flush ruleset", silent=True, echo=False, check=False)
 
     # Remove the modules that keep nf_conntrack held. Order matters: leaf
@@ -1062,7 +1062,7 @@ def ensure_conntrack_hooks_enabled():
     # passes: the first does the bulk of the work; the second catches
     # modules that became unloadable after their users were removed in
     # pass 1 (e.g. nf_nat frees up once xt_nat is gone).
-    output("  unloading dependent modules:")
+    vlog("  unloading dependent modules:")
     def _try_rmmod(mod):
         rc = subprocess.run(
             ["modprobe", "-r", mod],
@@ -1077,12 +1077,12 @@ def ensure_conntrack_hooks_enabled():
             continue  # Nothing to do; don't log noise for it.
         code, err = _try_rmmod(mod)
         if code == 0:
-            output(f"    [ok]   rmmod {mod}")
+            vlog(f"    [ok]   rmmod {mod}")
         else:
             still_loaded.append(mod)
             holders = _modules_using(mod)
             holder_info = f"held by {', '.join(sorted(holders))}" if holders else (err or "failed")
-            output(f"    [skip] rmmod {mod}: {holder_info}")
+            vlog(f"    [skip] rmmod {mod}: {holder_info}")
 
     # Pass 2 -- retry only the ones that failed, since pass 1 may have
     # removed their users. Stop once a full pass makes no progress.
@@ -1091,11 +1091,11 @@ def ensure_conntrack_hooks_enabled():
         for mod in still_loaded:
             if mod not in _loaded_modules():
                 # Someone else's removal took it with them.
-                output(f"    [ok]   {mod} auto-removed")
+                vlog(f"    [ok]   {mod} auto-removed")
                 continue
             code, err = _try_rmmod(mod)
             if code == 0:
-                output(f"    [ok]   rmmod {mod} (retry)")
+                vlog(f"    [ok]   rmmod {mod} (retry)")
             else:
                 progress.append(mod)
         if progress == still_loaded:
@@ -1105,11 +1105,11 @@ def ensure_conntrack_hooks_enabled():
     # Show what's still holding nf_conntrack before we try to remove it.
     holders = _modules_using("nf_conntrack")
     if holders:
-        output(f"  nf_conntrack still held by: {', '.join(sorted(holders))}")
+        vlog(f"  nf_conntrack still held by: {', '.join(sorted(holders))}")
     else:
-        output("  nf_conntrack has no remaining holders")
+        vlog("  nf_conntrack has no remaining holders")
 
-    output("  unloading nf_conntrack...")
+    vlog("  unloading nf_conntrack...")
     unload = subprocess.run(
         ["modprobe", "-r", "nf_conntrack"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -1128,9 +1128,9 @@ def ensure_conntrack_hooks_enabled():
             run("systemctl start docker", silent=True, echo=False, check=False)
         return
 
-    output("  [ok]   nf_conntrack unloaded")
+    vlog("  [ok]   nf_conntrack unloaded")
 
-    output("  loading nf_conntrack enable_hooks=1...")
+    vlog("  loading nf_conntrack enable_hooks=1...")
     reload = subprocess.run(
         ["modprobe", "nf_conntrack", "enable_hooks=1"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
