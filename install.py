@@ -2196,7 +2196,14 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
         error("Please run this script with sudo or as root")
         sys.exit(1)
 
-    os.system('apt-get install -qq -y python3-psutil apt-utils > /dev/null')
+    # Install apt-utils on its own FIRST, before any other package. If
+    # apt-utils is installed in the same apt-get transaction as other
+    # packages, debconf prints this warning during their configuration:
+    #   "debconf: delaying package configuration, since apt-utils is not installed"
+    # Splitting it out (and setting DEBIAN_FRONTEND=noninteractive so
+    # debconf doesn't try to ask questions either) keeps the install quiet.
+    os.system('DEBIAN_FRONTEND=noninteractive apt-get install -qq -y apt-utils > /dev/null 2>&1')
+    os.system('DEBIAN_FRONTEND=noninteractive apt-get install -qq -y python3-psutil > /dev/null')
     # /etc/modprobe.d/nf_conntrack.conf is written (and the running module
     # hot-reloaded if necessary) by ensure_conntrack_hooks_enabled(), which
     # runs as part of install_mediaproxy(). Doing it there — rather than
