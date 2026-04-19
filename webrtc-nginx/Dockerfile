@@ -42,6 +42,12 @@ FROM nginx:alpine
 
 COPY --from=build /build/dist /usr/share/nginx/html
 COPY --from=build /build/sylk-config.json /usr/share/nginx/html
+# Preserve the build-time config under a second name so it survives the
+# installer's post-build overwrite of sylk-config.json (which replaces it
+# with a version tailored for the Sylk Mobile client). sylk-config-website.json
+# lets you inspect exactly what was injected into the web frontend at
+# `make` time, to debug domain/port-related issues.
+COPY --from=build /build/sylk-config.json /usr/share/nginx/html/sylk-config-website.json
 
 EXPOSE 80 443
 
