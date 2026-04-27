@@ -2367,10 +2367,43 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     except Exception as e:
         print(f"Error writing DNS zones file: {e}")
 
-    # save DNS push
-    make_step("Mobile app enrollment")
+    # Where the front-end is reachable. Print the port only when it's
+    # not the standard 443 to keep the URL compact.
+    make_step("Sylk suite address")
     web_port_suffix = f":{data.web_port}" if data.web_port and data.web_port != "443" else ""
     output(f"Main web site: https://{data.full_domain}{web_port_suffix}/")
+
+    # save DNS push
+    make_step("Mobile app enrollment")
+    # Pull the enrollment URL out of sylk-config.json so what we display
+    # always matches what the mobile app will read. Two possible
+    # locations on disk:
+    #   * webrtc-nginx/html/sylk-config.json — populated from the
+    #     sylk-webrtc container via `docker cp` (install_sylkserver).
+    #     This is the one that actually exists in normal runs because
+    #     update_sylk_config() is currently commented out at the
+    #     install_sylkserver call site.
+    #   * webrtc-nginx/sylk-config.json — written by update_sylk_config()
+    #     when that path is re-enabled.
+    # Try the html copy first (real-world location), fall back to the
+    # bare one. Strip the trailing /user — that's the POST endpoint;
+    # the human-friendly base is what we want to surface here.
+    enrollment_url = ""
+    for sylk_config_path in (
+        DEST_DIR / "webrtc-nginx" / "html" / "sylk-config.json",
+        DEST_DIR / "webrtc-nginx" / "sylk-config.json",
+    ):
+        try:
+            with open(sylk_config_path) as f:
+                enrollment_url = json.load(f).get("enrollmentUrl", "")
+            if enrollment_url:
+                break
+        except (OSError, json.JSONDecodeError):
+            continue
+    if enrollment_url.endswith("/user"):
+        enrollment_url = enrollment_url.rsplit("/", 1)[0]
+    if enrollment_url:
+        output(f"Web site: {enrollment_url}/")
     os.system(f"qrencode -t ansiutf8 {data.full_domain}")
 
     output("Backup /opt/sylk-suite/logs folder, it contains your setup and Managed DNS credentials")
