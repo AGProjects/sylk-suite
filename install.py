@@ -2369,6 +2369,8 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
 
     # save DNS push
     make_step("Mobile app enrollment")
+    web_port_suffix = f":{data.web_port}" if data.web_port and data.web_port != "443" else ""
+    output(f"Main web site: https://{data.full_domain}{web_port_suffix}/")
     os.system(f"qrencode -t ansiutf8 {data.full_domain}")
 
     output("Backup /opt/sylk-suite/logs folder, it contains your setup and Managed DNS credentials")
