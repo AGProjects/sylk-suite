@@ -914,6 +914,13 @@ def ensure_conntrack_hooks_enabled():
     """Guarantee nf_conntrack is loaded with `enable_hooks=1` so MediaProxy
     can install NAT entries for RTP flows via NFNETLINK_CONNTRACK.
 
+    Behaviour: this function ALWAYS performs the live reload when the
+    module is currently loaded, on every call. The previous heuristic
+    that skipped the reload when filesystem evidence suggested hooks
+    were already effective has been removed by user request -- every
+    install_mediaproxy() run now leaves nf_conntrack in a known-good
+    state, at the cost of a docker bounce each time.
+
     Background: MediaProxy's relay inserts conntrack expectations from
     userspace for every RTP stream it bridges. The kernel's nf_conntrack
     only registers its hooks in a network namespace when something asks
@@ -976,14 +983,17 @@ def ensure_conntrack_hooks_enabled():
             error(f"Could not write {CONNTRACK_CONF_FILE}: {e}")
         return
 
-    # 2. If evidence says hooks are already effective, skip the disruption.
+    # 2. Diagnostic only -- we always proceed to the live reload so that
+    # every install_mediaproxy() run leaves the kernel in a known-good
+    # state. The previous "skip if already effective" fast-path was
+    # removed by user request; the reasoning the heuristic produced is
+    # still useful in --verbose logs for debugging.
     effective, reason = _conntrack_hooks_effective()
     if effective:
-        vlog(f"  nf_conntrack hooks already effective: {reason}")
-        vlog("  skipping reload (delete "
-             f"{CONNTRACK_RELOAD_MARKER} and re-run if you disagree)")
-        return
-    vlog(f"  reload needed: {reason}")
+        vlog(f"  nf_conntrack hooks look effective ({reason}),"
+             " but reloading anyway -- forced live reload at every mediaproxy run")
+    else:
+        vlog(f"  reload needed: {reason}")
 
     # 3. Module not loaded at all -> just load it with the option. Cheap.
     if not os.path.isdir("/sys/module/nf_conntrack"):
@@ -993,7 +1003,7 @@ def ensure_conntrack_hooks_enabled():
         vlog("  [ok]   nf_conntrack loaded with enable_hooks=1")
         return
 
-    # 4. Module loaded but options stale -> live-reload (disruptive).
+    # 4. Module loaded -> always live-reload (disruptive).
     vlog("Reloading nf_conntrack with enable_hooks=1 (needed for MediaProxy RTP relay)...")
 
     docker_was_active = subprocess.run(
@@ -1419,6 +1429,11 @@ def install_mediaproxy(data):
     # conntrack at the exact point the operator is installing the
     # component that needs it, rather than at the very top of main()
     # where docker has not yet been (re)installed.
+    #
+    # NOTE: ensure_conntrack_hooks_enabled() now performs the live
+    # reload unconditionally on every call (no boot-marker fast path),
+    # so each install_mediaproxy() run will bounce docker once while
+    # nf_conntrack is reloaded.
     #
     # ensure_conntrack_hooks_enabled() calls `nft flush ruleset` as part
     # of its cleanup, so make sure the nftables user-space CLI is
