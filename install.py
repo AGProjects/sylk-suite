@@ -2373,7 +2373,7 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     # not the standard 443 to keep the URL compact.
     make_step("Sylk suite address")
     web_port_suffix = f":{data.web_port}" if data.web_port and data.web_port != "443" else ""
-    output(f"Main web site: https://{data.full_domain}{web_port_suffix}/")
+    output(f"Main web site: https://{data.full_domain}{web_port_suffix}")
 
     # save DNS push
     make_step("Mobile app enrollment")
@@ -2405,7 +2405,7 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     if enrollment_url.endswith("/user"):
         enrollment_url = enrollment_url.rsplit("/", 1)[0]
     if enrollment_url:
-        output(f"Web site: {enrollment_url}/")
+        output(f"Web site: {enrollment_url}")
     os.system(f"qrencode -t ansiutf8 {data.full_domain}")
 
     output("Backup /opt/sylk-suite/logs folder, it contains your setup and Managed DNS credentials")
