@@ -1264,7 +1264,9 @@ def start_sylk_suite(data):
         -d xcap.{data.full_domain} \
         --email {data.email} \
         --agree-tos \
-        --no-eff-email"""),
+        --no-eff-email \
+        --keep-until-expiring \
+        -n"""),
         cwd=DEST_DIR,
         echo=False
     )
