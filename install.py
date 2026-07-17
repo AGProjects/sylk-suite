@@ -1249,12 +1249,13 @@ def start_sylk_suite(data):
     run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR, silent=True)
     run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR, silent=True)
     # Enable server-side addressbooks: point the webrtcgateway at this
-    # installation's XCAP root. Must match OpenXCAP's Server.root exactly
-    # (same host/port/path), see install_openxcap(). Done before `up` so
-    # sylkserver reads it on first start.
+    # installation's XCAP API base. NOTE: NOT the classic XCAP root --
+    # OpenXCAP mounts the JSON addressbook API at /api/v1 directly under
+    # the server root; /xcap-root prefixes only the legacy XCAP document
+    # tree (that form stays in install_openxcap's Server.root). 
     xcap_port = f":{data.web_port}" if data.web_port and data.web_port != "443" else ""
-    xcap_root = f"https://xcap.{data.full_domain}{xcap_port}/xcap-root"
-    run(f"sed -i 's|^;*[[:space:]]*xcap_url.*|xcap_url = {xcap_root}|' ./sylkserver/config/webrtcgateway.ini",
+    xcap_api_base = f"https://xcap.{data.full_domain}{xcap_port}"
+    run(f"sed -i 's|^;*[[:space:]]*xcap_url.*|xcap_url = {xcap_api_base}|' ./sylkserver/config/webrtcgateway.ini",
         cwd=DEST_DIR, silent=True)
     run(compose("up -d"), cwd=DEST_DIR)
     sleep(1)
@@ -1553,6 +1554,11 @@ def install_openxcap(data):
         config['Authentication'] = {}
     config['Authentication']['type'] = 'basic'
     config['Authentication']['default_realm'] = f"{data.full_domain}"
+    # Let sylkserver use the addressbook REST API without Basic auth.
+    # Its requests arrive via the sylk-webrtc nginx proxy, so the source
+    # address OpenXCAP sees is the host's own address (LOCAL_IP) -- trust
+    # it, plus the docker bridge for direct container-to-host calls.
+    config['Authentication']['trusted_peers'] = f"{data.local_ip}, {docker_ip}"
 
     if 'Database' not in config:
         config['Database'] = {}
