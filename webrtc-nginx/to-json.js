@@ -3,6 +3,10 @@ const fs = require('fs');
 const config = require('./src/app/config.js');
 const { defaultDomain } = require('./src/app/config.js');
 
+// advertise server-side addressbook (XCAP) support to Sylk Mobile clients;
+// the client keeps contacts local unless this is true
+config.addressBookServer = true;
+
 config.testNumbers = [
     {
       "uri": `echo@${defaultDomain}`,

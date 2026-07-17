@@ -1248,6 +1248,14 @@ def start_sylk_suite(data):
 
     run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR, silent=True)
     run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR, silent=True)
+    # Enable server-side addressbooks: point the webrtcgateway at this
+    # installation's XCAP root. Must match OpenXCAP's Server.root exactly
+    # (same host/port/path), see install_openxcap(). Done before `up` so
+    # sylkserver reads it on first start.
+    xcap_port = f":{data.web_port}" if data.web_port and data.web_port != "443" else ""
+    xcap_root = f"https://xcap.{data.full_domain}{xcap_port}/xcap-root"
+    run(f"sed -i 's|^;*[[:space:]]*xcap_url.*|xcap_url = {xcap_root}|' ./sylkserver/config/webrtcgateway.ini",
+        cwd=DEST_DIR, silent=True)
     run(compose("up -d"), cwd=DEST_DIR)
     sleep(1)
     run("chmod +x certbot/hooks/auth.py certbot/hooks/cleanup.py", cwd=DEST_DIR, silent=True)
@@ -1536,7 +1544,9 @@ def install_openxcap(data):
     config['Server']['address'] = f"{docker_ip}"
     config['Server']['port'] = "8080"
     config['Server']['backend'] = "OpenSIPS"
-    port = ":" + data.web_port if (data.web_port and data.web_port != "433") else ""
+    # NOTE: keep this in sync with the xcap_url written into
+    # sylkserver/config/webrtcgateway.ini by start_sylk_suite()
+    port = ":" + data.web_port if (data.web_port and data.web_port != "443") else ""
     config['Server']['root'] = f"https://xcap.{data.full_domain}{port}/xcap-root"
 
     if 'Authentication' not in config:
@@ -1599,6 +1609,7 @@ def update_sylk_config(data):
         },
         "showGuestCompleteScreen": True,
         "downloadUrl":             "https://sylkserver.com",
+        "addressBookServer":       True,
         "testNumbers": [
             {"uri": f"echo@{domain}",     "name": "Test microphone"},
             {"uri": f"playback@{domain}", "name": "Test video"}
