@@ -1,0 +1,32 @@
+# Debug override for sylkserver — run your local source tree in the foreground,
+# on top of the production installation under /opt/sylk-suite.
+#
+# Usage (ON THE SERVER):
+#   cd /opt/sylk-suite
+#   docker compose stop sylkserver
+#   docker compose -f docker-compose.yml -f ~/work/sylk-suite/docker-compose.debug.yml up sylkserver
+#
+# Base config, .env, network, tls volume and /opt/sylk-suite/sylkserver/config
+# all come from the production tree; only the CODE comes from ~/work.
+#
+# Edit code on the mac -> sync to the server (darcs push / rsync) ->
+# Ctrl+C and `up` again. No image rebuild needed.
+#
+# NOTE: paths below use ~ which docker compose expands to the home of the
+# user running the command. If you run compose via sudo, replace ~ with
+# the absolute home path (e.g. /home/agp).
+#
+# Extra tricks while it runs:
+#   docker kill -s USR1 sylkserver   # toggle DEBUG log level live
+#   docker kill -s USR2 sylkserver   # dump notification observers
+
+services:
+  sylkserver:
+    restart: "no"
+    volumes:
+      # code: your work tree, mounted over the deb-installed package
+      - ~/work/sylkserver/sylk:/usr/lib/python3/dist-packages/sylk
+      - ~/work/sylkserver/sylk-server:/usr/bin/sylk-server
+      # entrypoint from the work tree, so you can add --debug to the exec
+      # line without rebuilding or touching /opt:
+      - ~/work/sylk-suite/sylkserver/entrypoint.sh:/usr/local/bin/entrypoint.sh
