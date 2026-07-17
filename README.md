@@ -26,16 +26,15 @@ Use this installer to self-host a SIP/WEBRTC server under your own domain.
 
 # Ingredients
 
- - SIP Thor Managed DNS https://mdns.sipthor.net
  - OpenSIPS https://opensips.org
+ - OpenXCAP https://openxcap.org
  - SylkServer https://sylkserver.com
  - Janus https://janus.conf.meetecho.com
- - OpenXCAP https://openxcap.org
  - MediaProxy http://mediaproxy.ag-projects.com
  - MSRP Relay https://msrprelay.org
+ - SIP Thor Managed DNS https://mdns.sipthor.net
  - Mobile Android app (Sylk Mobile) https://play.google.com/store/apps/details?id=com.agprojects.sylk
  - Mobile iOS app (Sylk Mobile) https://apps.apple.com/us/app/id1489960733
- - Compatible with any SIP client
 
 
 # Uninstall
