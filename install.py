@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,6 +32,50 @@ _EMAIL_TLD_RE    = re.compile(r"^[A-Za-z]{2,}$")
 
 REPO_URL = "https://github.com/AGProjects/sylk-suite.git"
 DEST_DIR = Path("/opt/sylk-suite")
+
+# --- Local source tree -----------------------------------------------------
+#
+# install.py is normally run from a checkout of this very repository (a git
+# clone, or a darcs copy of the same tree). When that is the case, fetching
+# the code from GitHub is wrong: the checkout the user is sitting in IS the
+# version they want to deploy, including edits that are not pushed — or not
+# even recorded — yet. So if the directory holding this script looks like a
+# complete checkout, it is used as the source and copied into DEST_DIR on
+# EVERY run, which means local edits always reach the server.
+#
+# Pass --no-local-source to force the old behaviour (clone from GitHub).
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# A directory counts as a complete checkout only if all of these exist.
+REPO_MARKERS = ("docker-compose.yml", "sylkserver", "janus", "certbot",
+                "webrtc-nginx", "scripts")
+
+# Paths (relative to the repo root) that hold RUNTIME STATE inside DEST_DIR.
+# The sync must never overwrite these, no matter what the source tree has:
+#   logs/               setup.json, docker.env, dns_management.json, install log
+#   certbot/conf/       Let's Encrypt account key and issued certificates
+#   certbot/logs/       per-domain DNS metadata written by create_domain()
+#   */config/, conf/    generated from config-templates and sed-edited per run
+#   webrtc-nginx/html/  docker cp'd out of the running sylk-webrtc container
+SYNC_SKIP_PATHS = {
+    "logs",
+    "certbot/conf",
+    "certbot/logs",
+    "certbot/work",
+    "sylkserver/config",
+    "janus/config",
+    "janus/log",
+    "webrtc-nginx/conf",
+    "webrtc-nginx/html",
+}
+
+# Directory names skipped wherever they appear in the tree.
+SYNC_SKIP_DIRS = {"_darcs", ".git", ".svn", "__pycache__", ".pytest_cache"}
+
+# Editor and VCS droppings: emacs `foo~` and `foo.~1~`, patch .orig/.rej,
+# vim swap files, byte-compiled Python, macOS .DS_Store.
+_SYNC_SKIP_FILE_RE = re.compile(
+    r"(~$|\.~\d+~$|\.pyc$|\.orig$|\.rej$|\.swp$|^\.#|^\.DS_Store$)")
 DOMAIN = "sylk.link"
 ENROLLMENT_URL = "https://enrollment.sipthor.net/enrollment-sylk-domain.phtml"
 PUSH_URL = "http://ca-sip-01.sipthor.net:8400/push"
@@ -176,6 +221,80 @@ step = 0
 VERBOSE = False
 env = os.environ.copy()
 env['DEBIAN_FRONTEND'] = "noninteractive"
+
+# --- APT locking -----------------------------------------------------------
+#
+# Every apt-get invocation in this script goes through apt() so that a
+# concurrent package-manager run makes us WAIT rather than die with
+#   E: Could not get lock /var/lib/dpkg/lock-frontend
+# This is not a corner case: installing docker.io wakes up
+# unattended-upgrades, and the apt-daily/apt-daily-upgrade systemd timers
+# fire on a fresh cloud image within minutes of first boot, so the very
+# next apt-get in the script races them.
+#
+# Two belts:
+#   1. DPkg::Lock::Timeout makes apt itself block on the lock instead of
+#      bailing out. Honoured by apt >= 1.9.11 (Debian 11+, Ubuntu 20.04+);
+#      older apt silently ignores the unknown option.
+#   2. wait_for_apt_lock() polls /proc for a running package manager before
+#      we even start, which also covers those older apt versions and gives
+#      the user a clear "waiting for pid N" message instead of a stall.
+APT_LOCK_TIMEOUT = 600
+APT_GET = f"apt-get -o DPkg::Lock::Timeout={APT_LOCK_TIMEOUT}"
+
+# Process names (from /proc/<pid>/comm, so max 15 chars) that hold or
+# contend for the dpkg/apt locks.
+APT_PROCESS_NAMES = {
+    "apt", "apt-get", "aptitude", "dpkg", "dpkg-deb",
+    "unattended-upgr",   # unattended-upgrades, truncated by the kernel
+    "packagekitd", "synaptic",
+}
+
+
+def apt_lock_holder():
+    """Return "<pid> (<name>)" of another running package manager, else None."""
+    my_pid = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == my_pid:
+            continue
+        try:
+            with open(f"/proc/{entry}/comm") as f:
+                comm = f.read().strip()
+        except OSError:
+            continue  # process exited between listdir and open
+        if comm in APT_PROCESS_NAMES:
+            return f"{entry} ({comm})"
+    return None
+
+
+def wait_for_apt_lock(timeout=APT_LOCK_TIMEOUT):
+    """Block until no other package manager is running. True if the coast is clear."""
+    holder = apt_lock_holder()
+    if not holder:
+        return True
+
+    output(f"Another package manager is running (pid {holder}); "
+           f"waiting up to {timeout}s for it to finish")
+    waited = 0
+    while waited < timeout:
+        sleep(2)
+        waited += 2
+        holder = apt_lock_holder()
+        if not holder:
+            output(f"Package manager finished after {waited}s, continuing")
+            return True
+    error(f"Still waiting on pid {holder} after {timeout}s; giving up on the apt lock")
+    return False
+
+
+def apt(args, silent=True, check=True, echo=True):
+    """Run `apt-get <args>`, waiting for any concurrent package manager first."""
+    wait_for_apt_lock()
+    return run(f"{APT_GET} {args}", silent=silent, check=check, echo=echo)
 
 
 class Info():
@@ -861,11 +980,19 @@ def install_docker_compose():
         if not apt_package_exists(pkg):
             continue
         output(f"Installing Docker Compose from package {pkg}")
-        run(f"apt-get install -y -qq {pkg} > /dev/null", silent=True, check=False)
+        apt(f"install -y -qq {pkg} > /dev/null", check=False)
         reset_compose_base()
         base = compose_base(required=False)
         if base:
             output(f"Docker Compose installed ({base})")
+            if base == "docker-compose":
+                # Only reached when the release has no V2 package at all
+                # (e.g. Debian bookworm without backports). The stack works,
+                # but V1 is end-of-life upstream.
+                output("Note: this is the deprecated Compose V1. To move to V2, "
+                       "install docker-compose-v2 (bookworm-backports) or "
+                       "docker-compose-plugin from Docker's APT repo; this "
+                       "script picks it up automatically on the next run.")
             return
 
     error("Could not install a Docker Compose CLI. Tried: "
@@ -876,10 +1003,11 @@ def install_docker_compose():
 
 
 def install_docker():
-    run("apt-get update -qq && apt-get install -y ca-certificates curl gnupg > /dev/null", silent=True)
+    apt("update -qq")
+    apt("install -y ca-certificates curl gnupg > /dev/null")
     if not check_command("docker"):
-        run("apt-get update -qq", silent=True)
-        run("apt-get install -y -qq docker.io > /dev/null", silent=True)
+        apt("update -qq")
+        apt("install -y -qq docker.io > /dev/null")
         run("systemctl enable docker", silent=True)
         run("systemctl start docker", silent=True)
     else:
@@ -890,22 +1018,120 @@ def install_docker():
     install_docker_compose()
 
 
-def clone_repo():
+def is_repo_checkout(path):
+    """True if `path` holds a complete sylk-suite checkout."""
+    return all((path / marker).exists() for marker in REPO_MARKERS)
+
+
+def local_source_dir():
+    """Return the checkout install.py is running from, or None.
+
+    None means "fall back to cloning from GitHub": either this script does
+    not sit in a complete checkout, or it is already running from DEST_DIR
+    itself, in which case there is nothing to copy.
     """
-    Clone the repository once. If the destination already exists, leave it
-    completely alone — no `git pull`, no status check, no touching tracked
-    files. This lets the user apply local edits (for debugging, tweaking
-    configs, etc.) without having them blown away or blocking the next
-    install. To pull updates, the user can run git manually; to start
-    fresh they can delete DEST_DIR and re-run the installer.
+    if not is_repo_checkout(SCRIPT_DIR):
+        return None
+    if SCRIPT_DIR == Path(os.path.realpath(str(DEST_DIR))):
+        return None
+    return SCRIPT_DIR
+
+
+def sync_local_source(src, dest=DEST_DIR):
+    """Copy `src` over `dest`, overwriting files that differ.
+
+    Additive only: files that exist in `dest` but not in `src` are LEFT
+    ALONE, so a stale file from an older version survives until DEST_DIR is
+    removed by hand. That is deliberate — deleting under DEST_DIR risks
+    taking the Let's Encrypt certificates or the installer's own settings
+    with it.
+
+    Returns (copied_count, preserved_paths).
     """
+    copied = 0
+    preserved = []
+    dest.mkdir(parents=True, exist_ok=True)
+
+    for root, dirs, files in os.walk(src):
+        rel_root = Path(root).relative_to(src)
+
+        # Prune: never descend into VCS dirs or runtime-state paths.
+        keep = []
+        for name in dirs:
+            rel = (rel_root / name).as_posix()
+            if name in SYNC_SKIP_DIRS:
+                continue
+            if rel in SYNC_SKIP_PATHS:
+                if (dest / rel).exists():
+                    preserved.append(rel)
+                continue
+            keep.append(name)
+        dirs[:] = keep
+
+        (dest / rel_root).mkdir(parents=True, exist_ok=True)
+
+        for name in files:
+            if _SYNC_SKIP_FILE_RE.search(name):
+                continue
+            rel = (rel_root / name).as_posix()
+            if rel in SYNC_SKIP_PATHS:
+                continue
+            source_file = Path(root) / name
+            target_file = dest / rel
+            try:
+                if target_file.exists():
+                    s, t = source_file.stat(), target_file.stat()
+                    # Same size and mtime: assume unchanged, skip the copy.
+                    if s.st_size == t.st_size and int(s.st_mtime) == int(t.st_mtime):
+                        continue
+                shutil.copy2(source_file, target_file)
+                copied += 1
+            except OSError as e:
+                error(f"Could not copy {rel}: {e}")
+
+    return copied, preserved
+
+
+def clone_repo(use_local_source=True):
+    """
+    Populate DEST_DIR with the suite's files.
+
+    Two modes:
+
+    1. Local checkout (the default whenever install.py is run from one):
+       the checkout is copied over DEST_DIR on every run, so edits made
+       since the last run are deployed. Runtime state under DEST_DIR
+       (SYNC_SKIP_PATHS) is preserved, and nothing is deleted.
+
+    2. GitHub clone (--no-local-source, or install.py run standalone):
+       clone once. If DEST_DIR already exists, leave it completely alone —
+       no `git pull`, no status check, no touching tracked files, so local
+       edits on the server are neither blown away nor a blocker. To pull
+       updates the user can run git manually; to start fresh they can
+       delete DEST_DIR and re-run the installer.
+    """
+    src = local_source_dir() if use_local_source else None
+
+    if src:
+        output(f"Using the local checkout at {src} as source (not cloning from GitHub)")
+        copied, preserved = sync_local_source(src)
+        if copied:
+            output(f"Copied {copied} file(s) into {DEST_DIR}")
+        else:
+            output(f"{DEST_DIR} was already up to date")
+        if preserved:
+            output("Kept existing runtime state: " + ", ".join(sorted(set(preserved))))
+        output(f"Files deleted from the checkout are left behind in {DEST_DIR}; "
+               f"remove that directory for a clean slate.")
+        return
+
     if DEST_DIR.exists():
         output(f"Repo already exists at {DEST_DIR}, leaving it as-is "
                f"(delete it manually if you want a fresh clone).")
         return
 
     if not check_command("git"):
-        run("apt install -y -qq git", silent=True)
+        apt("install -y -qq git")
     output(f"Cloning repo into {DEST_DIR}...")
     run(f"git clone {REPO_URL} {DEST_DIR}", silent=True)
 
@@ -1362,6 +1588,35 @@ def cleanup_orphan_docker_bridges():
         output(f"Removed {len(removed)} orphan docker bridge(s): {', '.join(removed)}")
 
 
+def copy_config_templates(component):
+    """Refresh <component>/config from <component>/config-templates.
+
+    This used to be `cp -r ./x/config-templates ./x/config`, which only did
+    the right thing on the very first run: once the destination exists, cp
+    copies the directory INTO it (./x/config/config-templates/) instead of
+    over it, so every later edit to a template silently failed to reach the
+    running config. Copy the template CONTENTS instead, and clean up the
+    nested directory older runs left behind.
+
+    Note this means /opt/sylk-suite/<component>/config/ is rewritten from
+    the templates on every run: edit config-templates, not config.
+    """
+    templates = DEST_DIR / component / "config-templates"
+    config = DEST_DIR / component / "config"
+    if not templates.is_dir():
+        error(f"No {templates} to copy configuration from")
+        return
+
+    config.mkdir(parents=True, exist_ok=True)
+    run(f"cp -a ./{component}/config-templates/. ./{component}/config/",
+        cwd=DEST_DIR, silent=True)
+
+    stale = config / "config-templates"
+    if stale.is_dir():
+        shutil.rmtree(stale, ignore_errors=True)
+        output(f"Removed {stale} (left behind by an earlier installer run)")
+
+
 def start_sylk_suite(data):
     # Sweep up any docker bridge interfaces left behind by previous
     # installer runs (especially ones launched from a different cwd).
@@ -1370,8 +1625,8 @@ def start_sylk_suite(data):
     # port 60000 stops working -- see cleanup_orphan_docker_bridges().
     cleanup_orphan_docker_bridges()
 
-    run("cp -r ./sylkserver/config-templates ./sylkserver/config", cwd=DEST_DIR, silent=True)
-    run("cp -r ./janus/config-templates ./janus/config", cwd=DEST_DIR, silent=True)
+    copy_config_templates("sylkserver")
+    copy_config_templates("janus")
     # Enable server-side addressbooks: point the webrtcgateway at this
     # installation's XCAP API base. NOTE: NOT the classic XCAP root --
     # OpenXCAP mounts the JSON addressbook API at /api/v1 directly under
@@ -1436,7 +1691,8 @@ def install_opensips(data, mysql=True, force_mysql=False):
     run('echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm 3.5-releases" > /etc/apt/sources.list.d/opensips.list', silent=True)
     run('echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm cli-nightly" > /etc/apt/sources.list.d/opensips-cli.list', silent=True)
 
-    run("apt-get update -qq && apt-get install -qq -y opensips-config-sylkserver > /dev/null", silent=True)
+    apt("update -qq")
+    apt("install -qq -y opensips-config-sylkserver > /dev/null")
 
     run(f"cp -L {DEST_DIR}/certbot/conf/live/{data.full_domain}/fullchain.pem  /etc/opensips/tls/default.crt", silent=True)
     run(f"cp -L {DEST_DIR}/certbot/conf/live/{data.full_domain}/privkey.pem  /etc/opensips/tls/default.key", silent=True)
@@ -1574,7 +1830,7 @@ def install_mediaproxy(data):
     # of its cleanup, so make sure the nftables user-space CLI is
     # installed first (it's not present on all minimal Debian/Ubuntu/
     # Amazon Linux images).
-    run("apt-get install -y -qq nftables > /dev/null", silent=True)
+    apt("install -y -qq nftables > /dev/null")
     ensure_conntrack_hooks_enabled()
 
     run("cp /usr/share/doc/mediaproxy-common/tls/* /etc/mediaproxy/tls/", silent=True)
@@ -1656,7 +1912,7 @@ def install_msrprelay(data):
 
 
 def install_openxcap(data):
-    run("apt-get install -y -qq openxcap > /dev/null", silent=True)
+    apt("install -y -qq openxcap > /dev/null")
     config_path = '/etc/openxcap/config.ini'
 
     config = configparser.ConfigParser()
@@ -2203,6 +2459,11 @@ def show_installed():
     print("")
     print(f"{CYAN}Repository location{RESET}: {DEST_DIR}  "
           f"({'present' if DEST_DIR.exists() else 'absent'})")
+    src = local_source_dir()
+    if src:
+        print(f"{CYAN}Source for the next run{RESET}: {src}  (local checkout)")
+    else:
+        print(f"{CYAN}Source for the next run{RESET}: {REPO_URL}")
     print("")
 
 
@@ -2235,8 +2496,9 @@ def purge_files():
                            capture_output=True, text=True)
         # Use subprocess.run so a non-zero exit (e.g. a package that vanished
         # mid-purge) does not abort the whole cleanup.
+        wait_for_apt_lock()
         subprocess.run(
-            f"apt-get purge -y -qq {pkg_list}",
+            f"{APT_GET} purge -y -qq {pkg_list}",
             shell=True, env=env
         )
         output("Project packages purged")
@@ -2299,7 +2561,8 @@ def purge_files():
                 error(f"Could not remove {path}: {e}")
 
     if removed_any:
-        subprocess.run("apt-get update -qq", shell=True, env=env)
+        wait_for_apt_lock()
+        subprocess.run(f"{APT_GET} update -qq", shell=True, env=env)
 
     output("Debian package purge complete")
 
@@ -2375,9 +2638,10 @@ def reinstall_deps():
     pkg_list = " ".join(SYSTEM_DEB_DEPENDENCIES)
     # apt-get update can use HTTP mirrors so should work even if the CA
     # bundle is broken; the reinstall then restores it.
-    subprocess.run("apt-get update -qq", shell=True, env=env)
+    wait_for_apt_lock()
+    subprocess.run(f"{APT_GET} update -qq", shell=True, env=env)
     rc = subprocess.run(
-        f"apt-get install -y --reinstall -qq {pkg_list}",
+        f"{APT_GET} install -y --reinstall -qq {pkg_list}",
         shell=True, env=env
     ).returncode
     if rc != 0:
@@ -2391,7 +2655,8 @@ def reinstall_deps():
     output("System dependencies reinstalled and CA bundle refreshed")
 
 
-def main(components, exclude_components, force_mysql=False, skip_git=False):
+def main(components, exclude_components, force_mysql=False, skip_git=False,
+         use_local_source=True):
     if os.geteuid() != 0:
         error("Please run this script with sudo or as root")
         sys.exit(1)
@@ -2402,8 +2667,9 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
     #   "debconf: delaying package configuration, since apt-utils is not installed"
     # Splitting it out (and setting DEBIAN_FRONTEND=noninteractive so
     # debconf doesn't try to ask questions either) keeps the install quiet.
-    os.system('DEBIAN_FRONTEND=noninteractive apt-get install -qq -y apt-utils > /dev/null 2>&1')
-    os.system('DEBIAN_FRONTEND=noninteractive apt-get install -qq -y python3-psutil > /dev/null')
+    wait_for_apt_lock()
+    os.system(f'DEBIAN_FRONTEND=noninteractive {APT_GET} install -qq -y apt-utils > /dev/null 2>&1')
+    os.system(f'DEBIAN_FRONTEND=noninteractive {APT_GET} install -qq -y python3-psutil > /dev/null')
     # /etc/modprobe.d/nf_conntrack.conf is written (and the running module
     # hot-reloaded if necessary) by ensure_conntrack_hooks_enabled(), which
     # runs as part of install_mediaproxy(). Doing it there — rather than
@@ -2444,8 +2710,9 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
             install_components[comp] = False
 
     if not skip_git:
-        make_step("Clone repository")
-        clone_repo()
+        src = local_source_dir() if use_local_source else None
+        make_step("Copy local checkout" if src else "Clone repository")
+        clone_repo(use_local_source=use_local_source)
 
     # Persist the gathered settings once DEST_DIR (and therefore the logs/
     # directory) can safely exist. This replaces the old `.env` file.
@@ -2489,7 +2756,7 @@ def main(components, exclude_components, force_mysql=False, skip_git=False):
 
     run("chmod +x scripts/* > /dev/null", cwd=DEST_DIR, silent=True)
 
-    run("apt-get install -y -qq qrencode > /dev/null", silent=True)
+    apt("install -y -qq qrencode > /dev/null")
     try:
         result = dns_template.replace("IPADDR", data.ip).replace("DOMAINNAME", data.full_domain)
         weburl = data.full_domain
@@ -2595,7 +2862,16 @@ if __name__ == "__main__":
         "--skip-git",
         action="store_true",
         default=False,
-        help="Skip cloning or pulling the repository (use existing local copy)"
+        help="Skip populating %s entirely (use whatever is already there)" % DEST_DIR
+    )
+    parser.add_argument(
+        "--no-local-source",
+        action="store_true",
+        default=False,
+        help="Ignore the checkout this script is run from and clone the "
+             "repository from GitHub instead. By default, running install.py "
+             "from a complete checkout copies that checkout into %s on every "
+             "run." % DEST_DIR
     )
     parser.add_argument(
         "--show-installed",
@@ -2668,7 +2944,8 @@ if __name__ == "__main__":
                 purge_files()
             sys.exit(0)
 
-        main(args.include, args.exclude, force_mysql=args.force_mysql, skip_git=args.skip_git)
+        main(args.include, args.exclude, force_mysql=args.force_mysql,
+             skip_git=args.skip_git, use_local_source=not args.no_local_source)
 
     except KeyboardInterrupt:
         print()
