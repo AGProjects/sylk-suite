@@ -1,5 +1,17 @@
 version: "3.9"
 
+# Every ${VAR} below is REQUIRED and uses the ${VAR:?message} form on
+# purpose. This stack has no .env file: install.py writes the values to
+# /opt/sylk-suite/logs/docker.env and every compose command must pass
+#   --env-file /opt/sylk-suite/logs/docker.env
+# (see scripts/docker-up.sh, docker-down.sh, docker-logs.sh).
+#
+# Without it, compose substitutes an EMPTY string for each variable and
+# happily builds a working-looking stack whose URLs have no hostname —
+# 'https://:/enrollment/user' in the web frontend, blank LOCAL_IP/NAT in
+# sylkserver and janus. The :? guards turn that silent breakage into an
+# immediate, explanatory error.
+
 services:
   sylkserver:
     build:
@@ -21,11 +33,11 @@ services:
     depends_on:
       - janus
     environment:
-        LOCAL_IP: ${LOCAL_IP}
-        NAT: ${NAT}
-        FULL_DOMAIN: ${FULL_DOMAIN}
-        WEB_PORT: ${WEB_PORT}
-        SIP_PORT: ${SIP_PORT}
+        LOCAL_IP: "${LOCAL_IP:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        NAT: "${NAT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        FULL_DOMAIN: "${FULL_DOMAIN:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        WEB_PORT: "${WEB_PORT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        SIP_PORT: "${SIP_PORT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
     entrypoint: ["/usr/local/bin/entrypoint.sh"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -37,10 +49,10 @@ services:
     container_name: janus
     network_mode: host
     environment:
-        IP: ${IP}
-        NAT: ${NAT}
-        LOCAL_IP: ${LOCAL_IP}
-        RTP_PORT: ${RTP_PORT}
+        IP: "${IP:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        NAT: "${NAT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        LOCAL_IP: "${LOCAL_IP:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        RTP_PORT: "${RTP_PORT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
     entrypoint: ["/usr/local/bin/entrypoint.sh"]
     volumes:
       - ./janus/config:/etc/janus
@@ -50,9 +62,13 @@ services:
   webrtc:
     build:
       context: ./webrtc-nginx
+      # These two are baked into the web frontend's config.js at BUILD
+      # time. An empty value here overrides the ARG defaults in
+      # webrtc-nginx/Dockerfile and yields hostless URLs, so they must
+      # never be blank — hence :? rather than :- (issue #2).
       args:
-        FULL_DOMAIN: ${FULL_DOMAIN}
-        WEB_PORT: ${WEB_PORT}
+        FULL_DOMAIN: "${FULL_DOMAIN:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
+        WEB_PORT: "${WEB_PORT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}"
     image: sylk-webrtc-nginx
     container_name: sylk-webrtc
     volumes:
@@ -61,7 +77,7 @@ services:
     networks:
       - sylk-net
     ports:
-      - "${WEB_PORT:-443}:443"
+      - "${WEB_PORT:?not set - run install.py, or pass --env-file /opt/sylk-suite/logs/docker.env}:443"
       - "80:80"
     depends_on:
       - sylkserver
@@ -78,20 +94,26 @@ services:
       - ./certbot/conf:/etc/letsencrypt:rw
       - ./certbot/hooks:/hooks:ro
       - ./certbot/logs:/logs:rw
-    entrypoint: /bin/sh -c "
+    # NOTE: a folded block scalar (>-) joins these lines with spaces, so
+    # NO trailing backslashes belong here. The previous version had them,
+    # which passed literal '\' arguments to certbot and, worse, was missing
+    # one after --manual-auth-hook; `|| true` then swallowed the failure,
+    # so renewals silently never happened.
+    entrypoint: >-
+      /bin/sh -c "
       trap exit TERM;
       while :; do
-        sleep 12h & wait $${!};
-        chmod +x /hooks/auth.py /hooks/cleanup.py;
-        certbot renew \
-          --manual \
-          --preferred-challenges dns \
-          --manual-auth-hook /hooks/auth.py
-          --manual-cleanup-hook /hooks/cleanup.py \
-          --deploy-hook 'docker exec sylk-webrtc nginx -s reload' || true;
+      sleep 12h & wait $${!};
+      chmod +x /hooks/auth.py /hooks/cleanup.py;
+      certbot renew
+      --manual
+      --preferred-challenges dns
+      --manual-auth-hook /hooks/auth.py
+      --manual-cleanup-hook /hooks/cleanup.py
+      --deploy-hook 'docker exec sylk-webrtc nginx -s reload';
       done"
     restart: unless-stopped
-  
+
 networks:
   sylk-net:
     driver: bridge
@@ -101,4 +123,3 @@ networks:
 
 volumes:
   sylkserver_tls: {}
-
