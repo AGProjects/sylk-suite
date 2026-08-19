@@ -58,8 +58,14 @@ PROJECT_DEB_PACKAGES = [
     # Baseline utilities (main)
     "python3-psutil",
     "qrencode",
-    # Docker stack (install_docker)
+    # Docker stack (install_docker). The Compose CLI ships under several
+    # package names depending on the distro release (see
+    # COMPOSE_DEB_PACKAGES); all of them are listed so --show-installed
+    # reports whichever one is present and --purge-files removes it.
+    # Packages that are not installed are skipped by both code paths.
     "docker.io",
+    "docker-compose-v2",
+    "docker-compose-plugin",
     "docker-compose",
     # OpenSIPS stack (install_opensips). The meta-package pulls in the rest;
     # we still list them explicitly so --show-installed reports them and
@@ -109,6 +115,17 @@ DOCKER_CONTAINERS = ["sylkserver", "janus", "sylk-webrtc"]
 DOCKER_IMAGES = ["sylkserver:bookworm", "sylk-webrtc-nginx", "certbot/certbot"]
 DOCKER_VOLUMES = ["sylkserver_tls"]
 DOCKER_NETWORKS = ["sylk-net"]
+
+# Debian/Ubuntu package names that provide a Compose CLI, most preferred
+# first. Compose V2 is a Docker CLI plugin invoked as `docker compose`;
+# the standalone Python V1 `docker-compose` binary is deprecated upstream
+# and no longer packaged on current releases (Debian trixie, Ubuntu 24.04+),
+# which is why hard-coding `docker-compose` broke installs.
+#   docker-compose-v2      - Debian trixie / Ubuntu 24.04+ (provides `docker compose`)
+#   docker-compose-plugin  - Docker's own APT repo (provides `docker compose`)
+#   docker-compose         - legacy V1 binary, kept as a last resort for
+#                            older releases such as Debian bookworm
+COMPOSE_DEB_PACKAGES = ["docker-compose-v2", "docker-compose-plugin", "docker-compose"]
 
 starts = ["bl", "sn", "fl", "zo", "qu", "pl", "gr", "dr", "tr", "wh", "kr", "gl", "sp", "tw"]
 middles = ["a", "e", "i", "o", "u", "ai", "oo", "ee"]
@@ -414,25 +431,79 @@ class Info():
         return "\n".join(f"    {label:<25}: {value}" for label, value in fields)
 
 
-# Base docker-compose command with an explicit --env-file. Every
-# docker-compose invocation in this script MUST go through this constant
-# (or `compose(args)`) so the values the containers see match exactly
-# what the installer saved to setup.json.
-COMPOSE_CMD = f"docker-compose --env-file {Info.ENV_FILE}"
+# Cache for compose_base(); None means "not probed yet".
+_COMPOSE_BASE = None
 
 
-def compose(args):
-    """Return a 'docker-compose --env-file <ENV_FILE> <args>' command string.
+def compose_base(required=True):
+    """Return the Compose CLI invocation available on this host.
 
-    Falls back to a bare 'docker-compose' if the env file does not exist
+    Docker Compose V2 is a plugin of the docker CLI and is invoked as
+    `docker compose` (no hyphen). The standalone V1 `docker-compose`
+    binary is deprecated upstream and is not shipped by current
+    Debian/Ubuntu releases, so assuming it exists made the installer die
+    with "docker-compose: command not found". Probe for V2 first, fall
+    back to the legacy binary when only that is present.
+
+    With required=True (the default) the script exits with an actionable
+    message when neither is available. Callers that must not abort (the
+    teardown paths) pass required=False and get None instead.
+
+    The result is cached; call reset_compose_base() after installing a
+    Compose package to re-probe.
+    """
+    global _COMPOSE_BASE
+    if _COMPOSE_BASE is not None:
+        return _COMPOSE_BASE
+
+    probe = subprocess.run(
+        ["docker", "compose", "version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) if check_command("docker") else None
+
+    if probe is not None and probe.returncode == 0:
+        _COMPOSE_BASE = "docker compose"
+    elif check_command("docker-compose"):
+        _COMPOSE_BASE = "docker-compose"
+
+    if _COMPOSE_BASE is None and required:
+        error("No Docker Compose CLI found on this system.")
+        error("Install it with one of:")
+        for pkg in COMPOSE_DEB_PACKAGES:
+            error(f"    apt-get install -y {pkg}")
+        sys.exit(1)
+
+    return _COMPOSE_BASE
+
+
+def reset_compose_base():
+    """Forget the cached compose_base() probe result."""
+    global _COMPOSE_BASE
+    _COMPOSE_BASE = None
+
+
+def compose(args, required=True):
+    """Return a '<compose CLI> --env-file <ENV_FILE> <args>' command string.
+
+    The Compose CLI is whatever compose_base() found — `docker compose`
+    on any current system, `docker-compose` on older ones. Every Compose
+    invocation in this script MUST go through this helper so the values
+    the containers see match exactly what the installer saved to
+    setup.json.
+
+    Falls back to omitting --env-file if the env file does not exist
     yet. That keeps --purge-docker-files usable on a half-installed
     machine where setup.json was never written, and also lets a user run
     the teardown after having manually deleted /opt/sylk-suite/logs/
     without the cleanup itself blowing up on a missing file.
     """
+    base = compose_base(required=required)
+    if base is None:
+        return None
     if os.path.exists(Info.ENV_FILE):
-        return f"docker-compose --env-file {Info.ENV_FILE} {args}"
-    return f"docker-compose {args}"
+        return f"{base} --env-file {Info.ENV_FILE} {args}"
+    return f"{base} {args}"
 
 
 def question(step_number, title, question, default=None, step_color=CYAN, prompt_color=YELLOW):
@@ -755,15 +826,68 @@ def get_unique_short_subdomain(max_attempts=1000, domain="sylk.link"):
     raise RuntimeError("Kon geen unieke subdomein naam vinden!")
 
 
+def apt_package_exists(pkg):
+    """True if `pkg` is known to APT on this release (installable)."""
+    result = subprocess.run(
+        f"apt-cache policy {pkg}",
+        shell=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    # `apt-cache policy` prints "Candidate: (none)" for a package that is
+    # only known as a virtual/unavailable name.
+    for line in result.stdout.splitlines():
+        if line.strip().startswith("Candidate:"):
+            return "(none)" not in line
+    return False
+
+
+def install_docker_compose():
+    """Make sure some Compose CLI is available, preferring V2.
+
+    Tries the package names in COMPOSE_DEB_PACKAGES in order and stops at
+    the first one that is available on this release and actually yields a
+    working Compose CLI.
+    """
+    reset_compose_base()
+    base = compose_base(required=False)
+    if base:
+        output(f"Docker Compose already installed ({base})")
+        return
+
+    for pkg in COMPOSE_DEB_PACKAGES:
+        if not apt_package_exists(pkg):
+            continue
+        output(f"Installing Docker Compose from package {pkg}")
+        run(f"apt-get install -y -qq {pkg} > /dev/null", silent=True, check=False)
+        reset_compose_base()
+        base = compose_base(required=False)
+        if base:
+            output(f"Docker Compose installed ({base})")
+            return
+
+    error("Could not install a Docker Compose CLI. Tried: "
+          + ", ".join(COMPOSE_DEB_PACKAGES))
+    error("Install Compose manually (see https://docs.docker.com/compose/install/) "
+          "and re-run this script.")
+    sys.exit(1)
+
+
 def install_docker():
     run("apt-get update -qq && apt-get install -y ca-certificates curl gnupg > /dev/null", silent=True)
     if not check_command("docker"):
         run("apt-get update -qq", silent=True)
-        run("apt-get install -y -qq docker.io docker-compose > /dev/null", silent=True)
+        run("apt-get install -y -qq docker.io > /dev/null", silent=True)
         run("systemctl enable docker", silent=True)
         run("systemctl start docker", silent=True)
     else:
         output("Docker already installed")
+
+    # Compose is packaged separately from docker.io and, on current
+    # releases, only as the `docker compose` V2 plugin.
+    install_docker_compose()
 
 
 def clone_repo():
@@ -2042,7 +2166,9 @@ def show_installed():
         print("-" * 80)
         for vol in DOCKER_VOLUMES:
             found = False
-            # docker-compose v1 prefixes volumes with the project dir basename
+            # Compose prefixes volumes with the project name (the compose
+            # file's directory basename) unless the volume is declared
+            # external, so check both spellings.
             for name in (vol, f"{DEST_DIR.name}_{vol}"):
                 mp = _docker_inspect("volume", name, "{{.Mountpoint}}")
                 if mp:
@@ -2189,15 +2315,17 @@ def purge_docker_files():
         return
 
     compose_file = DEST_DIR / "docker-compose.yml"
-    if compose_file.exists():
-        make_step("Tearing down docker-compose stack")
+    teardown_cmd = compose("down -v --rmi all --remove-orphans", required=False)
+    if compose_file.exists() and teardown_cmd:
+        make_step("Tearing down the Compose stack")
         # -v removes named volumes, --rmi all removes both built and pulled
         # images referenced by the compose file, --remove-orphans cleans up
         # containers that used to be in the compose file.
-        subprocess.run(
-            compose("down -v --rmi all --remove-orphans"),
-            shell=True, cwd=str(DEST_DIR), env=env
-        )
+        subprocess.run(teardown_cmd, shell=True, cwd=str(DEST_DIR), env=env)
+    elif not teardown_cmd:
+        # No Compose CLI on the box (e.g. it was purged already). The
+        # by-name cleanup below still removes everything this script created.
+        output("No Docker Compose CLI found; cleaning resources by name")
     else:
         output(f"No docker-compose.yml at {DEST_DIR}; cleaning resources by name")
 
@@ -2490,7 +2618,7 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Remove the Docker containers, images, volumes and networks "
-             "created by this script (docker-compose down -v --rmi all)."
+             "created by this script (compose down -v --rmi all)."
     )
     parser.add_argument(
         "--reinstall-deps",
