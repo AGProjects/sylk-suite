@@ -24,6 +24,9 @@ services:
     ports:
       - "5060:5060"
       - "5061:5061"
+      # the MSRP connections of conference rooms and file transfers ([MSRP] port; 2855 is the
+      # MSRP relay's); behind NAT or an LXC host, forward the same port to this machine
+      - "2856:2856"
 #      - "10000-20000:10000-20000/udp"
     volumes:
       - ./sylkserver/config:/etc/sylkserver/
