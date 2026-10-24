@@ -31,6 +31,8 @@ services:
     volumes:
       - ./sylkserver/config:/etc/sylkserver/
       - sylkserver_tls:/etc/sylkserver/tls:ro
+      # the domain's certificate (certbot): the entrypoint makes SylkServer use it
+      - ./certbot/conf:/etc/letsencrypt:ro
       - ./sylkserver/data:/var/lib/sylkserver
       - ./sylkserver/logs:/var/log/sylkserver
     depends_on:
