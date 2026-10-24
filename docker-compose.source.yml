@@ -1,0 +1,28 @@
+# Source override for sylkserver — run the work tree /home/agp/work/sylkserver
+# in place of the deb-installed package, detached and restarted like the
+# production service (docker-compose.debug.yml is the same, in the foreground).
+#
+# Normally invoked via /opt/sylk-suite/scripts/docker-up-source.sh
+# (manual equivalent, ON THE SERVER):
+#   cd /opt/sylk-suite
+#   sudo docker compose --env-file logs/docker.env \
+#       -f docker-compose.yml -f /home/agp/work/sylk-suite/docker-compose.source.yml \
+#       up -d --no-deps --force-recreate sylkserver
+#
+# Base config, docker.env, ports, network, tls volume and
+# /opt/sylk-suite/sylkserver/config all come from the production tree; only the
+# CODE (and the entrypoint) comes from ~agp/work. Push code with darcs
+# (sylkserver/sync.sh), then `docker restart sylkserver`: no image rebuild.
+#
+# Back to the deb-installed package: /opt/sylk-suite/scripts/docker-up.sh
+
+services:
+  sylkserver:
+    # run via bash so the mounted entrypoint doesn't need the exec bit
+    # (darcs sync does not preserve file modes)
+    entrypoint: ["/bin/bash", "/usr/local/bin/entrypoint.sh"]
+    volumes:
+      # code: the work tree, mounted over the deb-installed package
+      - /home/agp/work/sylkserver/sylk:/usr/lib/python3/dist-packages/sylk
+      - /home/agp/work/sylkserver/sylk-server:/usr/bin/sylk-server
+      - /home/agp/work/sylk-suite/sylkserver/entrypoint.sh:/usr/local/bin/entrypoint.sh

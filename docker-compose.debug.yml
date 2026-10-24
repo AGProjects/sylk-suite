@@ -23,6 +23,9 @@
 services:
   sylkserver:
     restart: "no"
+    # run via bash so the mounted entrypoint doesn't need the exec bit
+    # (darcs sync does not preserve file modes)
+    entrypoint: ["/bin/bash", "/usr/local/bin/entrypoint.sh"]
     volumes:
       # code: the work tree, mounted over the deb-installed package
       - /home/agp/work/sylkserver/sylk:/usr/lib/python3/dist-packages/sylk
